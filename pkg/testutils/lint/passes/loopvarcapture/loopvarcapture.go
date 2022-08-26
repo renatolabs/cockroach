@@ -99,6 +99,8 @@ var (
 	// t.Run() and t.Parallel()
 	testRun      = Function{Pkg: "testing", Type: "T", Name: "Run"}
 	testParallel = Function{Pkg: "testing", Type: "T", Name: "Parallel"}
+
+	ginkgoIt = Function{Pkg: "github.com/onsi/ginkgo/v2", Name: "It"}
 )
 
 // Functions returns a list of function definitions for the target
@@ -409,6 +411,20 @@ func (v *Visitor) loopStatementInspector() func(n ast.Node) bool {
 						v.ForkAndRun(func(visitor *Visitor) {
 							visitor.isTestRun = true
 							visitor.safeDefer = true
+
+							visitor.runOnStatementBlock(funcLit.Body)
+						})
+
+						return false
+					}
+				}
+			} else if v.matchFunctionCall(node, []Function{ginkgoIt}) {
+				if len(node.Args) == 2 {
+					if funcLit, ok := node.Args[1].(*ast.FuncLit); ok {
+						v.ForkAndRun(func(visitor *Visitor) {
+							visitor.isTestRun = true
+							visitor.safeDefer = true
+							visitor.isTestParallel = true
 
 							visitor.runOnStatementBlock(funcLit.Body)
 						})
