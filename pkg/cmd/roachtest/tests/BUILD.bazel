@@ -160,6 +160,7 @@ go_library(
         "validate_system_schema_after_version_upgrade.go",
         "version.go",
         "versionupgrade.go",
+        "versionupgradev2.go",
         "ycsb.go",
     ],
     embedsrcs = ["predecessor_version.json"],

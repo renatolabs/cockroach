@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
@@ -25,7 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
-	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
@@ -91,100 +92,35 @@ func runVersionUpgrade(ctx context.Context, t test.Test, c cluster.Cluster) {
 	if runtime.GOARCH == "arm64" {
 		t.Skip("Skip under ARM64. See https://github.com/cockroachdb/cockroach/issues/89268")
 	}
-	predecessorVersion, err := PredecessorVersion(*t.BuildVersion())
-	if err != nil {
-		t.Fatal(err)
-	}
 
-	testFeaturesStep := versionUpgradeTestFeatures.step(c.All())
-	schemaChangeStep := runSchemaChangeWorkloadStep(c.All().RandNode()[0], 10 /* maxOps */, 2 /* concurrency */)
-	// TODO(irfansharif): All schema change instances were commented out while
-	// of #58489 is being addressed.
-	_ = schemaChangeStep
-	backupStep := func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
+	mvt := NewMixedVersionTest(ctx, t, c, c.All())
+
+	mvt.InMixedVersion("run backup", func(ctx context.Context, l *logger.Logger) error {
 		// Verify that backups can be created in various configurations. This is
 		// important to test because changes in system tables might cause backups to
 		// fail in mixed-version clusters.
 		dest := fmt.Sprintf("nodelocal://0/%d", timeutil.Now().UnixNano())
-		_, err := u.conn(ctx, t, 1).ExecContext(ctx, `BACKUP TO $1`, dest)
-		require.NoError(t, err)
-	}
+		_, err := mvt.SQLConn().ExecContext(ctx, `BACKUP TO $1`, dest)
+		return err
+	})
 
-	// The steps below start a cluster at predecessorVersion (from a fixture),
-	// then start an upgrade that is rolled back, and finally start and finalize
-	// the upgrade. Between each step, we run the feature tests defined in
-	// versionUpgradeTestFeatures.
-	u := newVersionUpgradeTest(c,
-		// Start the cluster from a fixture. That fixture's cluster version may
-		// be at the predecessor version (though in practice it's fully up to
-		// date, if it was created via the checkpointer above), so add a
-		// waitForUpgradeStep to make sure we're upgraded all the way before
-		// moving on.
-		//
-		// See the comment on createCheckpoints for details on fixtures.
-		uploadAndStartFromCheckpointFixture(c.All(), predecessorVersion),
+	mvt.InMixedVersion("test features", func(ctx context.Context, l *logger.Logger) error {
+		for _, step := range versionUpgradeTestFeatures {
+			l.Printf("running %q", step.name)
+			if err := step.fn(ctx, t, mvt.legacyUpgrade, mvt.crdbNodes); err != nil {
+				return err
+			}
+		}
 
-		// lower descriptor lease duration to 1 minute, working around a
-		// lease leak that can occasionally make this test time out (flake
-		// rate ~3%).
-		//
-		// TODO(renato): remove this call and function definition when
-		// https://github.com/cockroachdb/cockroach/issues/84382 is
-		// closed.
-		lowerLeaseDuration(1),
+		return nil
+	})
 
-		uploadAndInitSchemaChangeWorkload(),
-		waitForUpgradeStep(c.All()),
-		testFeaturesStep,
+	mvt.Run()
 
-		// NB: at this point, cluster and binary version equal predecessorVersion,
-		// and auto-upgrades are on.
-
-		// We use an empty string for the version below, which means to use the
-		// main ./cockroach binary (i.e. the one being tested in this run).
-		// We upgrade into this version more capriciously to ensure better
-		// coverage by first rolling the cluster into the new version with
-		// auto-upgrade disabled, then rolling back, and then rolling forward
-		// and finalizing on the auto-upgrade path.
-		preventAutoUpgradeStep(1),
-		// Roll nodes forward.
-		binaryUpgradeStep(c.Node(1), ""),
-		testFeaturesStep,
-		binaryUpgradeStep(c.Range(2, c.Spec().NodeCount), ""),
-		// Run a quick schemachange workload in between each upgrade.
-		// The maxOps is 10 to keep the test runtime under 1-2 minutes.
-		// schemaChangeStep,
-		backupStep,
-		// Roll back again. Note that bad things would happen if the cluster had
-		// ignored our request to not auto-upgrade. The `autoupgrade` roachtest
-		// exercises this in more detail, so here we just rely on things working
-		// as they ought to.
-		binaryUpgradeStep(c.All(), predecessorVersion),
-		testFeaturesStep,
-		// schemaChangeStep,
-		backupStep,
-		// Roll nodes forward, this time allowing them to upgrade, and waiting
-		// for it to happen.
-		binaryUpgradeStep(c.All(), ""),
-		allowAutoUpgradeStep(1),
-		testFeaturesStep,
-		// schemaChangeStep,
-		backupStep,
-		waitForUpgradeStep(c.All()),
-		testFeaturesStep,
-		// schemaChangeStep,
-		backupStep,
-		// Turn tracing on globally to give it a fighting chance at exposing any
-		// crash-inducing incompatibilities or horrendous memory leaks. (It won't
-		// catch most memory leaks since this test doesn't run for too long or does
-		// too much work). Then, run the previous tests again.
-		enableTracingGloballyStep,
-		testFeaturesStep,
-		// schemaChangeStep,
-		backupStep,
-	)
-
-	u.run(ctx, t)
+	// enableTracingGloballyStep,
+	// testFeaturesStep,
+	// schemaChangeStep,
+	// backupStep,
 }
 
 func (u *versionUpgradeTest) run(ctx context.Context, t test.Test) {
@@ -301,7 +237,9 @@ func (u *versionUpgradeTest) binaryVersion(
 	db := u.conn(ctx, t, i)
 
 	var sv string
-	if err := db.QueryRow(`SELECT crdb_internal.node_executable_version();`).Scan(&sv); err != nil {
+	if err := db.
+		QueryRow(`SELECT regexp_replace(crdb_internal.node_executable_version()::string, '10000', '');`).
+		Scan(&sv); err != nil {
 		t.Fatal(err)
 	}
 
@@ -505,6 +443,7 @@ func waitForUpgradeStep(nodes option.NodeListOption) versionStep {
 		for _, i := range nodes {
 			err := retry.ForDuration(5*time.Minute, func() error {
 				currentVersion := u.clusterVersion(ctx, t, i).String()
+				currentVersion = strings.ReplaceAll(currentVersion, "10000", "")
 				if currentVersion != newVersion {
 					return fmt.Errorf("%d: expected version %s, got %s", i, newVersion, currentVersion)
 				}
@@ -537,7 +476,7 @@ func setClusterSettingVersionStep(ctx context.Context, t test.Test, u *versionUp
 
 type versionFeatureTest struct {
 	name string
-	fn   func(context.Context, test.Test, *versionUpgradeTest, option.NodeListOption) (skipped bool)
+	fn   func(context.Context, test.Test, *versionUpgradeTest, option.NodeListOption) error
 }
 
 type versionFeatureStep []versionFeatureTest
@@ -547,13 +486,9 @@ func (vs versionFeatureStep) step(nodes option.NodeListOption) versionStep {
 		for _, feature := range vs {
 			t.L().Printf("checking %s", feature.name)
 			tBegin := timeutil.Now()
-			skipped := feature.fn(ctx, t, u, nodes)
+			_ = feature.fn(ctx, t, u, nodes)
 			dur := fmt.Sprintf("%.2fs", timeutil.Since(tBegin).Seconds())
-			if skipped {
-				t.L().Printf("^-- skip (%s)", dur)
-			} else {
-				t.L().Printf("^-- ok (%s)", dur)
-			}
+			t.L().Printf("^-- took %s", dur)
 		}
 	}
 }
@@ -563,21 +498,14 @@ func stmtFeatureTest(
 ) versionFeatureTest {
 	return versionFeatureTest{
 		name: name,
-		fn: func(ctx context.Context, t test.Test, u *versionUpgradeTest, nodes option.NodeListOption) (skipped bool) {
+		fn: func(ctx context.Context, t test.Test, u *versionUpgradeTest, nodes option.NodeListOption) error {
 			i := nodes.RandNode()[0]
 			if u.clusterVersion(ctx, t, i).Less(minVersion) {
-				return true // skipped
+				return nil // skipped
 			}
 			db := u.conn(ctx, t, i)
-			if _, err := db.ExecContext(ctx, stmt, args...); err != nil {
-				if testutils.IsError(err, "no inbound stream connection") && u.clusterVersion(ctx, t, i).Less(v202) {
-					// This error has been fixed in 20.2+ but may still occur on earlier
-					// versions.
-					return true // skipped
-				}
-				t.Fatal(err)
-			}
-			return false
+			_, err := db.ExecContext(ctx, stmt, args...)
+			return err
 		},
 	}
 }

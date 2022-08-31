@@ -358,6 +358,8 @@ func runCDCMixedVersions(
 		return tester.crdbNodes[rng.Intn(len(tester.crdbNodes))]
 	}
 
+	// mvt := NewMixedVersionTest(ctx, t, c)
+
 	// An empty string will lead to the cockroach binary specified by flag
 	// `cockroach` to be used.
 	const mainVersion = ""
