@@ -12,7 +12,9 @@ package tests
 
 import (
 	"context"
+	gosql "database/sql"
 	"fmt"
+	"math/rand"
 	"strconv"
 	"strings"
 	"time"
@@ -165,6 +167,13 @@ func (cmvt *cdcMixedVersionTester) waitForResolvedTimestamps() versionStep {
 	}
 }
 
+func (cmvt *cdcMixedVersionTester) dbFactory(t test.Test, u *versionUpgradeTest) func() *gosql.DB {
+	return func() *gosql.DB {
+		node := cmvt.crdbNodes[rand.Intn(len(cmvt.crdbNodes))]
+		return u.conn(cmvt.ctx, t, node)
+	}
+}
+
 // setupVerifier creates a CDC validator to validate that a changefeed
 // created on the `target` table is able to re-create the table
 // somewhere else. It also verifies CDC's ordering guarantees. This
@@ -192,7 +201,7 @@ func (cmvt *cdcMixedVersionTester) setupVerifier(node int) versionStep {
 				t.Fatal(err)
 			}
 
-			fprintV, err := cdctest.NewFingerprintValidator(db, tableName, `fprint`, consumer.partitions, 0, true)
+			fprintV, err := cdctest.NewFingerprintValidator(cmvt.dbFactory(t, u), tableName, `fprint`, consumer.partitions, 0, true)
 			if err != nil {
 				t.Fatal(err)
 			}

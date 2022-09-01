@@ -326,7 +326,7 @@ type validatorRow struct {
 // fingerprintValidator verifies that recreating a table from its changefeed
 // will fingerprint the same at all "interesting" points in time.
 type fingerprintValidator struct {
-	sqlDB                  *gosql.DB
+	sqlDB                  func() *gosql.DB
 	origTable, fprintTable string
 	primaryKeyCols         []string
 	partitionResolved      map[string]hlc.Timestamp
@@ -362,7 +362,7 @@ type fingerprintValidator struct {
 // will modify `fprint`'s schema to add `maxTestColumnCount` columns to avoid having to
 // accommodate schema changes on the fly.
 func NewFingerprintValidator(
-	sqlDB *gosql.DB,
+	sqlDB func() *gosql.DB,
 	origTable, fprintTable string,
 	partitions []string,
 	maxTestColumnCount int,
@@ -371,14 +371,14 @@ func NewFingerprintValidator(
 	// Fetch the primary keys though information_schema schema inspections so we
 	// can use them to construct the SQL for DELETEs and also so we can verify
 	// that the key in a message matches what's expected for the value.
-	primaryKeyCols, err := fetchPrimaryKeyCols(sqlDB, fprintTable)
+	primaryKeyCols, err := fetchPrimaryKeyCols(sqlDB(), fprintTable)
 	if err != nil {
 		return nil, err
 	}
 
 	// Record the non-test%d columns in `fprint`.
 	var fprintOrigColumns int
-	if err := sqlDB.QueryRow(`
+	if err := sqlDB().QueryRow(`
 		SELECT count(column_name)
 		FROM information_schema.columns
 		WHERE table_name=$1
@@ -396,7 +396,7 @@ func NewFingerprintValidator(
 			}
 			fmt.Fprintf(&addColumnStmt, `ADD COLUMN test%d STRING`, i)
 		}
-		if _, err := sqlDB.Exec(addColumnStmt.String()); err != nil {
+		if _, err := sqlDB().Exec(addColumnStmt.String()); err != nil {
 			return nil, err
 		}
 	}
@@ -513,7 +513,7 @@ func (v *fingerprintValidator) applyRowUpdate(row validatorRow) (_err error) {
 	}
 
 	return v.maybeRetry(func() error {
-		_, err := v.sqlDB.Exec(stmtBuf.String(), args...)
+		_, err := v.sqlDB().Exec(stmtBuf.String(), args...)
 		return err
 	})
 }
@@ -595,7 +595,7 @@ func (v *fingerprintValidator) NoteResolved(partition string, resolved hlc.Times
 func (v *fingerprintValidator) fingerprint(ts hlc.Timestamp) error {
 	var orig string
 	if err := v.maybeRetry(func() error {
-		return v.sqlDB.QueryRow(`SELECT IFNULL(fingerprint, 'EMPTY') FROM [
+		return v.sqlDB().QueryRow(`SELECT IFNULL(fingerprint, 'EMPTY') FROM [
 		SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE ` + v.origTable + `
 	] AS OF SYSTEM TIME '` + ts.AsOfSystemTime() + `'`).Scan(&orig)
 	}); err != nil {
@@ -603,17 +603,63 @@ func (v *fingerprintValidator) fingerprint(ts hlc.Timestamp) error {
 	}
 	var check string
 	if err := v.maybeRetry(func() error {
-		return v.sqlDB.QueryRow(`SELECT IFNULL(fingerprint, 'EMPTY') FROM [
+		return v.sqlDB().QueryRow(`SELECT IFNULL(fingerprint, 'EMPTY') FROM [
 		SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE ` + v.fprintTable + `
 	]`).Scan(&check)
 	}); err != nil {
 		return err
 	}
 	if orig != check {
+		// origContent := v.queryTable(v.origTable, ts.AsOfSystemTime())
+		// fprintContent := v.queryTable(v.fprintTable)
+		// fmt.Printf("%s:\n%s\n\n%s:\n%s\n\n", v.origTable, origContent, v.fprintTable, fprintContent)
 		v.failures = append(v.failures, fmt.Sprintf(
 			`fingerprints did not match at %s: %s vs %s`, ts.AsOfSystemTime(), orig, check))
 	}
 	return nil
+}
+
+func (v *fingerprintValidator) queryTable(name string, t ...string) string {
+	query := fmt.Sprintf("SELECT id, balance, payload FROM %s", name)
+	if len(t) == 0 {
+		query += " ORDER BY id"
+	} else {
+		query += fmt.Sprintf(" AS OF SYSTEM TIME '%s' ORDER BY id", t[0])
+	}
+
+	rows, err := v.sqlDB().Query(query)
+	if err != nil {
+		v.failures = append(v.failures, fmt.Sprintf("error getting data for table %s: %s", name, err))
+		return ""
+	}
+
+	type row struct {
+		ID      int
+		Balance int
+		Payload string
+	}
+	var result []string
+	for rows.Next() {
+		var r row
+		err = rows.Scan(&r.ID, &r.Balance, &r.Payload)
+		if err != nil {
+			break
+		}
+
+		var blob []byte
+		blob, err = gojson.Marshal(r)
+		if err != nil {
+			break
+		}
+
+		result = append(result, string(blob))
+	}
+
+	if err != nil {
+		v.failures = append(v.failures, fmt.Sprintf("error reading row for table %s: %s", name, err))
+		return ""
+	}
+	return strings.Join(result, "\n")
 }
 
 // Failures implements the Validator interface.
@@ -626,7 +672,18 @@ func (v *fingerprintValidator) Failures() []string {
 // should be made my closures passed to this function
 func (v *fingerprintValidator) maybeRetry(f func() error) error {
 	if v.shouldRetry {
-		return retry.ForDuration(retryDuration, f)
+		err := retry.ForDuration(retryDuration, func() error {
+			err := f()
+			if err != nil {
+				fmt.Printf(">>> error running SQL query (retrying): %v\n", err)
+			}
+
+			return err
+		})
+
+		if err != nil {
+			panic(fmt.Sprintf("maybeRetry failed: %s", err))
+		}
 	}
 
 	return f()
