@@ -76,6 +76,7 @@ type cdcMixedVersionTester struct {
 	}
 	kafka     kafkaManager
 	validator *cdctest.CountValidator
+	fprintV   cdctest.Validator
 	cleanup   func()
 }
 
@@ -192,10 +193,11 @@ func (cmvt *cdcMixedVersionTester) setupVerifier(node int) versionStep {
 				t.Fatal(err)
 			}
 
-			fprintV, err := cdctest.NewFingerprintValidator(db, tableName, `fprint`, consumer.partitions, 0, true)
+			fprintV, err := cdctest.NewFingerprintValidator(db, tableName, `fprint`, consumer.partitions, 0, true, t.L().Printf)
 			if err != nil {
 				t.Fatal(err)
 			}
+			cmvt.fprintV = fprintV
 			validators := cdctest.Validators{
 				cdctest.NewOrderValidator(tableName),
 				fprintV,
@@ -248,6 +250,9 @@ func (cmvt *cdcMixedVersionTester) timestampResolved() {
 // time the function is called.
 func (cmvt *cdcMixedVersionTester) assertValid() versionStep {
 	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
+		if err := cmvt.fprintV.AssertValid(); err != nil {
+			t.Fatal(err)
+		}
 		if failures := cmvt.validator.Failures(); len(failures) > 0 {
 			t.Fatalf("validator failures:\n%s", strings.Join(failures, "\n"))
 		}

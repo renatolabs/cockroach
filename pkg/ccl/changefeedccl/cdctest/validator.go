@@ -20,6 +20,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -30,6 +31,7 @@ type Validator interface {
 	NoteRow(partition string, key, value string, updated hlc.Timestamp) error
 	// NoteResolved accepts a resolved timestamp entry.
 	NoteResolved(partition string, resolved hlc.Timestamp) error
+	AssertValid() error
 	// Failures returns any violations seen so far.
 	Failures() []string
 }
@@ -71,6 +73,8 @@ type noOpValidator struct{}
 
 // NoteRow accepts a changed row entry.
 func (v *noOpValidator) NoteRow(string, string, string, hlc.Timestamp) error { return nil }
+
+func (v *noOpValidator) AssertValid() error { return nil }
 
 // NoteResolved accepts a resolved timestamp entry.
 func (v *noOpValidator) NoteResolved(string, hlc.Timestamp) error { return nil }
@@ -129,6 +133,8 @@ func (v *orderValidator) GetValuesForKeyBelowTimestamp(
 
 	return kv, nil
 }
+
+func (v *orderValidator) AssertValid() error { return nil }
 
 // NoteRow implements the Validator interface.
 func (v *orderValidator) NoteRow(partition string, key, value string, updated hlc.Timestamp) error {
@@ -213,6 +219,8 @@ func NewBeforeAfterValidator(sqlDB *gosql.DB, table string) (Validator, error) {
 		resolved:       make(map[string]hlc.Timestamp),
 	}, nil
 }
+
+func (v *beforeAfterValidator) AssertValid() error { return nil }
 
 // NoteRow implements the Validator interface.
 func (v *beforeAfterValidator) NoteRow(
@@ -323,6 +331,11 @@ type validatorRow struct {
 	updated    hlc.Timestamp
 }
 
+type resolvedRow struct {
+	partition string
+	timestamp hlc.Timestamp
+}
+
 // fingerprintValidator verifies that recreating a table from its changefeed
 // will fingerprint the same at all "interesting" points in time.
 type fingerprintValidator struct {
@@ -346,11 +359,14 @@ type fingerprintValidator struct {
 	fprintOrigColumns int
 	fprintTestColumns int
 	buffer            []validatorRow
+	resolvedBuffer    []resolvedRow
 
 	// shouldRetry indicates whether row updates should be retried (for
 	// a fixed duration). Typically used when the transient errors are
 	// expected (e.g., if performing an upgrade)
 	shouldRetry bool
+
+	printer func(f string, args ...interface{})
 
 	failures []string
 }
@@ -367,6 +383,7 @@ func NewFingerprintValidator(
 	partitions []string,
 	maxTestColumnCount int,
 	shouldRetry bool,
+	printer func(string, ...interface{}),
 ) (Validator, error) {
 	// Fetch the primary keys though information_schema schema inspections so we
 	// can use them to construct the SQL for DELETEs and also so we can verify
@@ -409,6 +426,7 @@ func NewFingerprintValidator(
 		fprintOrigColumns: fprintOrigColumns,
 		fprintTestColumns: maxTestColumnCount,
 		shouldRetry:       shouldRetry,
+		printer:           printer,
 	}
 	v.partitionResolved = make(map[string]hlc.Timestamp)
 	for _, partition := range partitions {
@@ -441,7 +459,7 @@ func (v *fingerprintValidator) applyRowUpdate(row validatorRow) (_err error) {
 	var args []interface{}
 	var primaryKeyDatums []interface{}
 	if err := gojson.Unmarshal([]byte(row.key), &primaryKeyDatums); err != nil {
-		return err
+		return fmt.Errorf("error: %w\ninput: %s", err, row.key)
 	}
 	if len(primaryKeyDatums) != len(v.primaryKeyCols) {
 		return errors.Errorf(`expected primary key columns %s got datums %s`,
@@ -518,8 +536,34 @@ func (v *fingerprintValidator) applyRowUpdate(row validatorRow) (_err error) {
 	})
 }
 
-// NoteResolved implements the Validator interface.
 func (v *fingerprintValidator) NoteResolved(partition string, resolved hlc.Timestamp) error {
+	v.resolvedBuffer = append(v.resolvedBuffer, resolvedRow{partition, resolved})
+	return nil
+}
+
+func (v *fingerprintValidator) AssertValid() error {
+	v.print("processing %d resolved timestamps", len(v.resolvedBuffer))
+	for i, rr := range v.resolvedBuffer {
+		v.print("starting timestamp %d", i+1)
+		now := timeutil.Now()
+		if err := v.DoNoteResolved(rr.partition, rr.timestamp); err != nil {
+			return err
+		}
+		v.print("finished timestamp %d after %s", i+1, timeutil.Since(now))
+	}
+
+	v.resolvedBuffer = nil
+	return nil
+}
+
+func (v *fingerprintValidator) print(f string, args ...interface{}) {
+	if v.printer != nil {
+		v.printer(f, args...)
+	}
+}
+
+// NoteResolved implements the Validator interface.
+func (v *fingerprintValidator) DoNoteResolved(partition string, resolved hlc.Timestamp) error {
 	if r, ok := v.partitionResolved[partition]; !ok {
 		return errors.Errorf(`unknown partition: %s`, partition)
 	} else if resolved.LessEq(r) {
@@ -646,6 +690,16 @@ func (vs Validators) NoteRow(partition string, key, value string, updated hlc.Ti
 	return nil
 }
 
+func (vs Validators) AssertValid() error {
+	for _, v := range vs {
+		if err := v.AssertValid(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // NoteResolved implements the Validator interface.
 func (vs Validators) NoteResolved(partition string, resolved hlc.Timestamp) error {
 	for _, v := range vs {
@@ -679,6 +733,8 @@ type CountValidator struct {
 func MakeCountValidator(v Validator) *CountValidator {
 	return &CountValidator{v: v}
 }
+
+func (v *CountValidator) AssertValid() error { return nil }
 
 // NoteRow implements the Validator interface.
 func (v *CountValidator) NoteRow(partition string, key, value string, updated hlc.Timestamp) error {
