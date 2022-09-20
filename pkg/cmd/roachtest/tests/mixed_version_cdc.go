@@ -12,6 +12,7 @@ package tests
 
 import (
 	"context"
+	gosql "database/sql"
 	"fmt"
 	"strconv"
 	"strings"
@@ -74,9 +75,10 @@ type cdcMixedVersionTester struct {
 		syncutil.Mutex
 		C chan struct{}
 	}
-	kafka     kafkaManager
-	validator *cdctest.CountValidator
-	cleanup   func()
+	crdbUpgrading syncutil.Mutex
+	kafka         kafkaManager
+	validator     *cdctest.CountValidator
+	cleanup       func()
 }
 
 func newCDCMixedVersionTester(
@@ -192,7 +194,8 @@ func (cmvt *cdcMixedVersionTester) setupVerifier(node int) versionStep {
 				t.Fatal(err)
 			}
 
-			fprintV, err := cdctest.NewFingerprintValidator(db, tableName, `fprint`, consumer.partitions, 0, true)
+			getConn := func(node int) *gosql.DB { return u.conn(ctx, t, node) }
+			fprintV, err := cdctest.NewFingerprintValidator(cmvt.cdcDBConn(getConn), tableName, `fprint`, consumer.partitions, 0)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -241,6 +244,25 @@ func (cmvt *cdcMixedVersionTester) timestampResolved() {
 
 	if cmvt.timestampsResolved.C != nil {
 		cmvt.timestampsResolved.C <- struct{}{}
+	}
+}
+
+func (cmvt *cdcMixedVersionTester) cdcDBConn(getConn func(int) *gosql.DB) func(func(*gosql.DB) error) error {
+	return func(f func(*gosql.DB) error) error {
+		cmvt.crdbUpgrading.Lock()
+		defer cmvt.crdbUpgrading.Unlock()
+
+		node := cmvt.crdbNodes.RandNode()[0]
+		return f(getConn(node))
+	}
+}
+
+func (cmvt *cdcMixedVersionTester) crdbUpgradeStep(step versionStep) versionStep {
+	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
+		cmvt.crdbUpgrading.Lock()
+		defer cmvt.crdbUpgrading.Unlock()
+
+		step(ctx, t, u)
 	}
 }
 
@@ -300,7 +322,7 @@ func runCDCMixedVersions(
 	// `cockroach` to be used.
 	const mainVersion = ""
 	newVersionUpgradeTest(c,
-		uploadAndStartFromCheckpointFixture(tester.crdbNodes, predecessorVersion),
+		tester.crdbUpgradeStep(uploadAndStartFromCheckpointFixture(tester.crdbNodes, predecessorVersion)),
 		tester.setupVerifier(sqlNode()),
 		tester.installAndStartWorkload(),
 		waitForUpgradeStep(tester.crdbNodes),
@@ -312,7 +334,7 @@ func runCDCMixedVersions(
 
 		tester.waitForResolvedTimestamps(),
 		// Roll the nodes into the new version one by one in random order
-		binaryUpgradeStep(tester.crdbNodes, mainVersion),
+		tester.crdbUpgradeStep(binaryUpgradeStep(tester.crdbNodes, mainVersion)),
 		// let the workload run in the new version for a while
 		tester.waitForResolvedTimestamps(),
 
@@ -320,13 +342,13 @@ func runCDCMixedVersions(
 
 		// Roll back again, which ought to be fine because the cluster upgrade was
 		// not finalized.
-		binaryUpgradeStep(tester.crdbNodes, predecessorVersion),
+		tester.crdbUpgradeStep(binaryUpgradeStep(tester.crdbNodes, predecessorVersion)),
 		tester.waitForResolvedTimestamps(),
 
 		tester.assertValid(),
 
 		// Roll nodes forward and finalize upgrade.
-		binaryUpgradeStep(tester.crdbNodes, mainVersion),
+		tester.crdbUpgradeStep(binaryUpgradeStep(tester.crdbNodes, mainVersion)),
 
 		// allow cluster version to update
 		allowAutoUpgradeStep(sqlNode()),
