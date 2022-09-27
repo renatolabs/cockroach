@@ -37,6 +37,10 @@ const (
 	// resolvedInterval is the value passed to the `resolved` option
 	// when creating the changefeed
 	resolvedInterval = "10s"
+
+	seed                    = 1
+	maxOps                  = 10000
+	bankWorkloadConcurrency = 1
 )
 
 var (
@@ -45,7 +49,7 @@ var (
 	targetDB    = "bank"
 	targetTable = "bank"
 
-	timeout = 30 * time.Minute
+	timeout = 60 * time.Minute
 )
 
 func registerCDCMixedVersions(r registry.Registry) {
@@ -76,6 +80,7 @@ type cdcMixedVersionTester struct {
 		C chan struct{}
 	}
 	crdbUpgrading syncutil.Mutex
+	workloadDone  chan struct{}
 	kafka         kafkaManager
 	validator     *cdctest.CountValidator
 	cleanup       func()
@@ -96,6 +101,7 @@ func newCDCMixedVersionTester(
 		workloadNodes: lastNode,
 		kafkaNodes:    lastNode,
 		monitor:       c.NewMonitor(ctx, crdbNodes),
+		workloadDone:  make(chan struct{}),
 	}
 }
 
@@ -123,10 +129,14 @@ func (cmvt *cdcMixedVersionTester) installAndStartWorkload() versionStep {
 		t.Status("installing and running workload")
 		u.c.Run(ctx, cmvt.workloadNodes, "./workload init bank {pgurl:1}")
 		cmvt.monitor.Go(func(ctx context.Context) error {
+			defer close(cmvt.workloadDone)
 			return u.c.RunE(
 				ctx,
 				cmvt.workloadNodes,
-				fmt.Sprintf("./workload run bank {pgurl%s} --max-rate=10 --tolerate-errors", cmvt.crdbNodes),
+				fmt.Sprintf(
+					"./workload run bank {pgurl%s} --max-rate=10 --seed %d --max-ops %d --concurrency %d --tolerate-errors",
+					cmvt.crdbNodes, seed, maxOps, bankWorkloadConcurrency,
+				),
 			)
 		})
 	}
@@ -164,6 +174,16 @@ func (cmvt *cdcMixedVersionTester) waitForResolvedTimestamps() versionStep {
 
 			cmvt.timestampsResolved.C = nil
 		}()
+	}
+}
+
+func (cmvt *cdcMixedVersionTester) waitForWorkload() versionStep {
+	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
+		t.L().Printf("waiting for workload to finish...")
+		<-cmvt.workloadDone
+		t.L().Printf("workload finished")
+
+		time.Sleep(3 * time.Minute)
 	}
 }
 
@@ -299,7 +319,7 @@ func (cmvt *cdcMixedVersionTester) createChangeFeed(node int) versionStep {
 func runCDCMixedVersions(
 	ctx context.Context, t test.Test, c cluster.Cluster, buildVersion version.Version,
 ) {
-	predecessorVersion, err := PredecessorVersion(buildVersion)
+	/* predecessorVersion */ _, err := PredecessorVersion(buildVersion)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -322,7 +342,7 @@ func runCDCMixedVersions(
 	// `cockroach` to be used.
 	const mainVersion = ""
 	newVersionUpgradeTest(c,
-		tester.crdbUpgradeStep(uploadAndStartFromCheckpointFixture(tester.crdbNodes, predecessorVersion)),
+		tester.crdbUpgradeStep(uploadAndStart(tester.crdbNodes, mainVersion)),
 		tester.setupVerifier(sqlNode()),
 		tester.installAndStartWorkload(),
 		waitForUpgradeStep(tester.crdbNodes),
@@ -330,7 +350,7 @@ func runCDCMixedVersions(
 		// NB: at this point, cluster and binary version equal predecessorVersion,
 		// and auto-upgrades are on.
 		preventAutoUpgradeStep(sqlNode()),
-		tester.createChangeFeed(sqlNode()),
+		tester.createChangeFeed(1),
 
 		tester.waitForResolvedTimestamps(),
 		// Roll the nodes into the new version one by one in random order
@@ -342,7 +362,7 @@ func runCDCMixedVersions(
 
 		// Roll back again, which ought to be fine because the cluster upgrade was
 		// not finalized.
-		tester.crdbUpgradeStep(binaryUpgradeStep(tester.crdbNodes, predecessorVersion)),
+		tester.crdbUpgradeStep(binaryUpgradeStep(tester.crdbNodes, mainVersion)),
 		tester.waitForResolvedTimestamps(),
 
 		tester.assertValid(),
@@ -355,6 +375,7 @@ func runCDCMixedVersions(
 		waitForUpgradeStep(tester.crdbNodes),
 
 		tester.waitForResolvedTimestamps(),
+		tester.waitForWorkload(),
 		tester.assertValid(),
 	).run(ctx, t)
 }

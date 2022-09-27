@@ -13,6 +13,8 @@ import (
 	gosql "database/sql"
 	gojson "encoding/json"
 	"fmt"
+	"math/rand"
+	"os"
 	"sort"
 	"strings"
 
@@ -522,6 +524,57 @@ func (v *fingerprintValidator) applyRowUpdate(row validatorRow) (_err error) {
 	})
 }
 
+func (v *fingerprintValidator) dumpTables(ts hlc.Timestamp) error {
+	n := fmt.Sprintf("%d", rand.Int())
+	return v.withSQLDB(func(db *gosql.DB) error {
+		if err := v.dumpTable(db, v.fprintTable, n, hlc.Timestamp{}, false); err != nil {
+			return err
+		}
+		return v.dumpTable(db, v.origTable, n, ts, true)
+	})
+}
+
+func (v *fingerprintValidator) dumpTable(db *gosql.DB, table, suffix string, ts hlc.Timestamp, aost bool) error {
+	type rowS struct {
+		ID      int    `json:"id"`
+		Balance int    `json:"balance"`
+		Payload string `json:"payload"`
+	}
+
+	aostQuery := ""
+	if aost {
+		aostQuery = fmt.Sprintf(" AS OF SYSTEM TIME '%s'", ts.AsOfSystemTime())
+	}
+	query := fmt.Sprintf("SELECT id, balance, payload FROM %s%s ORDER BY id", table, aostQuery)
+	f, err := os.Create("/tmp/" + table + "_" + suffix + ".json")
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	fmt.Printf(">> [dest: %s] running query: %q\n", f.Name(), query)
+	rows, err := db.Query(query)
+	if err != nil {
+		return err
+	}
+
+	for rows.Next() {
+		var row rowS
+		if err := rows.Scan(&row.ID, &row.Balance, &row.Payload); err != nil {
+			return err
+		}
+
+		if err := gojson.NewEncoder(f).Encode(row); err != nil {
+			return err
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // NoteResolved implements the Validator interface.
 func (v *fingerprintValidator) NoteResolved(partition string, resolved hlc.Timestamp) error {
 	if r, ok := v.partitionResolved[partition]; !ok {
@@ -614,6 +667,11 @@ func (v *fingerprintValidator) fingerprint(ts hlc.Timestamp) error {
 		return err
 	}
 	if orig != check {
+		if len(v.failures) == 0 {
+			if err := v.dumpTables(ts); err != nil {
+				return err
+			}
+		}
 		v.failures = append(v.failures, fmt.Sprintf(
 			`fingerprints did not match at %s: %s vs %s`, ts.AsOfSystemTime(), orig, check))
 	}
