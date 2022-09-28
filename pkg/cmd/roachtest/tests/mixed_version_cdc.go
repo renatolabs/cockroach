@@ -276,11 +276,11 @@ func (cmvt *cdcMixedVersionTester) crdbUpgradeStep(step versionStep) versionStep
 		cmvt.crdbUpgrading.Lock()
 		defer cmvt.crdbUpgrading.Unlock()
 
-		node := cmvt.crdbNodes.RandNode()[0]
-		db := u.conn(ctx, t, node)
+		// node := cmvt.crdbNodes.RandNode()[0]
+		// db := u.conn(ctx, t, node)
 
-		cmvt.pauseChangefeed(t, db)
-		defer cmvt.resumeChangefeed(t, db)
+		// cmvt.pauseChangefeed(t, db)
+		// defer cmvt.resumeChangefeed(t, db)
 
 		step(ctx, t, u)
 	}
@@ -341,7 +341,7 @@ func (cmvt *cdcMixedVersionTester) createChangeFeed(node int) versionStep {
 func runCDCMixedVersions(
 	ctx context.Context, t test.Test, c cluster.Cluster, buildVersion version.Version,
 ) {
-	predecessorVersion, err := PredecessorVersion(buildVersion)
+	/* predecessorVersion */ _, err := PredecessorVersion(buildVersion)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -364,7 +364,7 @@ func runCDCMixedVersions(
 	// `cockroach` to be used.
 	const mainVersion = ""
 	newVersionUpgradeTest(c,
-		tester.crdbUpgradeStep(uploadAndStartFromCheckpointFixture(tester.crdbNodes, predecessorVersion)),
+		tester.crdbUpgradeStep(uploadAndStart(tester.crdbNodes, mainVersion)),
 		tester.setupVerifier(sqlNode()),
 		tester.installAndStartWorkload(),
 		waitForUpgradeStep(tester.crdbNodes),
@@ -384,7 +384,7 @@ func runCDCMixedVersions(
 
 		// Roll back again, which ought to be fine because the cluster upgrade was
 		// not finalized.
-		tester.crdbUpgradeStep(binaryUpgradeStep(tester.crdbNodes, predecessorVersion)),
+		tester.crdbUpgradeStep(binaryUpgradeStep(tester.crdbNodes, mainVersion)),
 		tester.waitForResolvedTimestamps(),
 
 		tester.assertValid(),
