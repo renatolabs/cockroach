@@ -15,6 +15,7 @@ import (
 	gosql "database/sql"
 	"fmt"
 	"math/rand"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -425,8 +426,15 @@ func upgradeNodes(
 		// this upgraded node for DistSQL plans (see #87154 for more details).
 		// TODO(yuzefovich): ideally, we would also check that the drain was
 		// successful since if it wasn't, then we might see flakes too.
-		if err := c.StopCockroachGracefullyOnNode(ctx, t.L(), node); err != nil {
-			t.Fatal(err)
+		gracefulShutdown := os.Getenv("ROACHTEST_STOP_GRACEFULLY") == "true"
+		if gracefulShutdown {
+			t.L().Printf("stopping node %d (gracefully)", node)
+			if err := c.StopCockroachGracefullyOnNode(ctx, t.L(), node); err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			t.L().Printf("stopping node %d", node)
+			c.Stop(ctx, t.L(), option.DefaultStopOpts(), c.Node(node))
 		}
 
 		binary := uploadVersion(ctx, t, c, c.Node(node), newVersion)
