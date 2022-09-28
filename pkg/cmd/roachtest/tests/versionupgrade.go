@@ -448,7 +448,7 @@ func upgradeNodes(
 		// papering over these flakes by this sleep. For more context, see
 		// #87104.
 		// TODO(yuzefovich): remove this sleep once #87634 is fixed.
-		time.Sleep(4 * time.Second)
+		time.Sleep(20 * time.Second)
 	}
 }
 
