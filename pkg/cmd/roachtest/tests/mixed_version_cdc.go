@@ -288,21 +288,6 @@ func (cmvt *cdcMixedVersionTester) crdbUpgradeStep(step versionStep) versionStep
 		cmvt.crdbUpgrading.Lock()
 		defer cmvt.crdbUpgrading.Unlock()
 
-		runJobOp := func(db *gosql.DB, op string) {
-			if _, err := db.Exec(fmt.Sprintf("%s JOB $1", op), cmvt.changefeedJobID); err != nil {
-				t.Fatal(err)
-			}
-		}
-
-		node := cmvt.crdbNodes.RandNode()[0]
-		db := u.conn(ctx, t, node)
-		// pause the changefeed while the upgrade is in process. Without
-		// this, tests frequently fail with fingerprint mismatch errors
-		// during the test
-		// TODO: remove this once #88948 is resolved
-		runJobOp(db, "PAUSE")
-		defer runJobOp(db, "RESUME")
-
 		step(ctx, t, u)
 	}
 }
@@ -342,7 +327,7 @@ func (cmvt *cdcMixedVersionTester) createChangeFeed(node int) versionStep {
 func runCDCMixedVersions(
 	ctx context.Context, t test.Test, c cluster.Cluster, buildVersion version.Version,
 ) {
-	predecessorVersion, err := PredecessorVersion(buildVersion)
+	/* predecessorVersion */ _, err := PredecessorVersion(buildVersion)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -365,7 +350,7 @@ func runCDCMixedVersions(
 	// `cockroach` to be used.
 	const mainVersion = ""
 	newVersionUpgradeTest(c,
-		uploadAndStartFromCheckpointFixture(tester.crdbNodes, predecessorVersion),
+		uploadAndStart(tester.crdbNodes, mainVersion),
 		tester.setupVerifier(sqlNode()),
 		tester.installAndStartWorkload(),
 		waitForUpgradeStep(tester.crdbNodes),
@@ -385,16 +370,10 @@ func runCDCMixedVersions(
 
 		// Roll back again, which ought to be fine because the cluster upgrade was
 		// not finalized.
-		tester.crdbUpgradeStep(binaryUpgradeStep(tester.crdbNodes, predecessorVersion)),
+		tester.crdbUpgradeStep(binaryUpgradeStep(tester.crdbNodes, mainVersion)),
 		tester.waitForResolvedTimestamps(),
 
 		tester.assertValid(),
-
-		// Roll nodes forward and finalize upgrade.
-		tester.crdbUpgradeStep(binaryUpgradeStep(tester.crdbNodes, mainVersion)),
-
-		// allow cluster version to update
-		allowAutoUpgradeStep(sqlNode()),
 		waitForUpgradeStep(tester.crdbNodes),
 
 		tester.waitForResolvedTimestamps(),
