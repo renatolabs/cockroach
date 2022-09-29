@@ -546,6 +546,7 @@ func (v *fingerprintValidator) NoteResolved(partition string, resolved hlc.Times
 	if newResolved.LessEq(v.resolved) {
 		return nil
 	}
+	previousResolved := v.resolved
 	v.resolved = newResolved
 
 	// NB: Intentionally not stable sort because it shouldn't matter.
@@ -567,6 +568,10 @@ func (v *fingerprintValidator) NoteResolved(partition string, resolved hlc.Times
 		// are safe because, if the operation can fail, the caller should
 		// be setting the `shouldRetry` field accordingly
 		v.buffer = v.buffer[1:]
+
+		if row.updated.Less(previousResolved) {
+			continue
+		}
 
 		// If we've processed all row updates belonging to the previous row's timestamp,
 		// we fingerprint at `updated.Prev()` since we want to catch cases where one or

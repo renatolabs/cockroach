@@ -75,13 +75,12 @@ type cdcMixedVersionTester struct {
 		syncutil.Mutex
 		C chan struct{}
 	}
-	crdbUpgrading   syncutil.Mutex
-	kafka           kafkaManager
-	changefeedJobID int
-	validator       *cdctest.CountValidator
-	validatorDone   chan struct{} // validator is no longer waiting for messages
-	validatorStop   bool          // used  to tell the validator to stop validating messages
-	cleanup         func()
+	crdbUpgrading syncutil.Mutex
+	kafka         kafkaManager
+	validator     *cdctest.CountValidator
+	validatorDone chan struct{} // validator is no longer waiting for messages
+	validatorStop bool          // used  to tell the validator to stop validating messages
+	cleanup       func()
 }
 
 func newCDCMixedVersionTester(
@@ -290,21 +289,6 @@ func (cmvt *cdcMixedVersionTester) crdbUpgradeStep(step versionStep) versionStep
 		cmvt.crdbUpgrading.Lock()
 		defer cmvt.crdbUpgrading.Unlock()
 
-		runJobOp := func(db *gosql.DB, op string) {
-			if _, err := db.Exec(fmt.Sprintf("%s JOB $1", op), cmvt.changefeedJobID); err != nil {
-				t.Fatal(err)
-			}
-		}
-
-		node := cmvt.crdbNodes.RandNode()[0]
-		db := u.conn(ctx, t, node)
-		// pause the changefeed while the upgrade is in process. Without
-		// this, tests frequently fail with fingerprint mismatch errors
-		// during the test
-		// TODO(renatolabs): remove this once #88948 is resolved
-		runJobOp(db, "PAUSE")
-		defer runJobOp(db, "RESUME")
-
 		step(ctx, t, u)
 	}
 }
@@ -330,14 +314,12 @@ func (cmvt *cdcMixedVersionTester) createChangeFeed(node int) versionStep {
 			{"updated", ""},
 			{"resolved", fmt.Sprintf("'%s'", resolvedInterval)},
 		}
-		jobID, err := newChangefeedCreator(db, fmt.Sprintf("%s.%s", targetDB, targetTable), cmvt.kafka.sinkURL(ctx)).
+		_, err := newChangefeedCreator(db, fmt.Sprintf("%s.%s", targetDB, targetTable), cmvt.kafka.sinkURL(ctx)).
 			With(options...).
 			Create()
 		if err != nil {
 			t.Fatal(err)
 		}
-
-		cmvt.changefeedJobID = jobID
 	}
 }
 
