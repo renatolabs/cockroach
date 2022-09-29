@@ -327,6 +327,7 @@ type fingerprintValidator struct {
 	primaryKeyCols         []string
 	partitionResolved      map[string]hlc.Timestamp
 	resolved               hlc.Timestamp
+	resolvedHistory        []hlc.Timestamp
 	// It's possible to get a resolved timestamp from before the table even
 	// exists, which is valid but complicates the way fingerprintValidator works.
 	// Don't create a fingerprint earlier than the first seen row.
@@ -342,6 +343,9 @@ type fingerprintValidator struct {
 	fprintOrigColumns int
 	fprintTestColumns int
 	buffer            []validatorRow
+	onFirstFailure    func(hlc.Timestamp, string, []hlc.Timestamp, string)
+	seenUpdates       map[string]map[string]struct{}
+	printer           func(string, ...interface{})
 
 	failures []string
 }
@@ -366,6 +370,8 @@ func NewFingerprintValidator(
 	origTable, fprintTable string,
 	partitions []string,
 	maxTestColumnCount int,
+	onFirstFailure func(hlc.Timestamp, string, []hlc.Timestamp, string),
+	printer func(string, ...interface{}),
 ) (Validator, error) {
 	// Fetch the primary keys though information_schema schema inspections so we
 	// can use them to construct the SQL for DELETEs and also so we can verify
@@ -416,6 +422,9 @@ func NewFingerprintValidator(
 		primaryKeyCols:    primaryKeyCols,
 		fprintOrigColumns: fprintOrigColumns,
 		fprintTestColumns: maxTestColumnCount,
+		onFirstFailure:    onFirstFailure,
+		seenUpdates:       make(map[string]map[string]struct{}),
+		printer:           printer,
 	}
 	v.partitionResolved = make(map[string]hlc.Timestamp)
 	for _, partition := range partitions {
@@ -525,6 +534,12 @@ func (v *fingerprintValidator) applyRowUpdate(row validatorRow) (_err error) {
 	})
 }
 
+func (v *fingerprintValidator) print(msg string, args ...interface{}) {
+	if v.printer != nil {
+		v.printer(msg, args...)
+	}
+}
+
 // NoteResolved implements the Validator interface.
 func (v *fingerprintValidator) NoteResolved(partition string, resolved hlc.Timestamp) error {
 	if r, ok := v.partitionResolved[partition]; !ok {
@@ -546,7 +561,9 @@ func (v *fingerprintValidator) NoteResolved(partition string, resolved hlc.Times
 	if newResolved.LessEq(v.resolved) {
 		return nil
 	}
+	previousResolved := v.resolved
 	v.resolved = newResolved
+	v.resolvedHistory = append(v.resolvedHistory, newResolved)
 
 	// NB: Intentionally not stable sort because it shouldn't matter.
 	sort.Slice(v.buffer, func(i, j int) bool {
@@ -568,12 +585,22 @@ func (v *fingerprintValidator) NoteResolved(partition string, resolved hlc.Times
 		// be setting the `shouldRetry` field accordingly
 		v.buffer = v.buffer[1:]
 
+		if row.updated.Less(previousResolved) {
+			_, previouslySeen := v.seenUpdates[row.key][row.updated.AsOfSystemTime()]
+			var total int
+			for _, m := range v.seenUpdates {
+				total += len(m)
+			}
+			v.print("received unexpected timestamp %s (earlier than %s) -> %t (seen: %d)",
+				row.updated.AsOfSystemTime(), previousResolved.AsOfSystemTime(), previouslySeen, total)
+		}
+
 		// If we've processed all row updates belonging to the previous row's timestamp,
 		// we fingerprint at `updated.Prev()` since we want to catch cases where one or
 		// more row updates are missed. For example: If k1 was written at t1, t2, t3 and
 		// the update for t2 was missed.
 		if !v.previousRowUpdateTs.IsEmpty() && v.previousRowUpdateTs.Less(row.updated) {
-			if err := v.fingerprint(row.updated.Prev()); err != nil {
+			if err := v.fingerprint(row.updated.Prev(), fmt.Sprintf("%#v", row), "when validating previous TS"); err != nil {
 				return err
 			}
 		}
@@ -585,21 +612,25 @@ func (v *fingerprintValidator) NoteResolved(partition string, resolved hlc.Times
 		// before fingerprinting.
 		if len(v.buffer) == 0 || v.buffer[0].updated != row.updated {
 			lastFingerprintedAt = row.updated
-			if err := v.fingerprint(row.updated); err != nil {
+			if err := v.fingerprint(row.updated, fmt.Sprintf("%#v", row), "when validating row's TS"); err != nil {
 				return err
 			}
 		}
 		v.previousRowUpdateTs = row.updated
+		if v.seenUpdates[row.key] == nil {
+			v.seenUpdates[row.key] = make(map[string]struct{})
+		}
+		v.seenUpdates[row.key][row.updated.AsOfSystemTime()] = struct{}{}
 	}
 
 	if !v.firstRowTimestamp.IsEmpty() && v.firstRowTimestamp.LessEq(resolved) &&
 		lastFingerprintedAt != resolved {
-		return v.fingerprint(resolved)
+		return v.fingerprint(resolved, "", "when validating the resolved TS itself")
 	}
 	return nil
 }
 
-func (v *fingerprintValidator) fingerprint(ts hlc.Timestamp) error {
+func (v *fingerprintValidator) fingerprint(ts hlc.Timestamp, row, context string) error {
 	var orig string
 	if err := v.withSQLDB(func(db *gosql.DB) error {
 		return db.QueryRow(`SELECT IFNULL(fingerprint, 'EMPTY') FROM [
@@ -617,6 +648,9 @@ func (v *fingerprintValidator) fingerprint(ts hlc.Timestamp) error {
 		return err
 	}
 	if orig != check {
+		if len(v.failures) == 0 && v.onFirstFailure != nil {
+			v.onFirstFailure(ts, context, v.resolvedHistory, row)
+		}
 		v.failures = append(v.failures, fmt.Sprintf(
 			`fingerprints did not match at %s: %s vs %s`, ts.AsOfSystemTime(), orig, check))
 	}

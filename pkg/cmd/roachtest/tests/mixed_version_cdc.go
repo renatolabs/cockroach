@@ -13,7 +13,10 @@ package tests
 import (
 	"context"
 	gosql "database/sql"
+	"encoding/json"
 	"fmt"
+	"math/rand"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -23,6 +26,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -46,6 +50,10 @@ var (
 	targetTable = "bank"
 
 	timeout = 30 * time.Minute
+
+	seed        = 42
+	concurrency = 1
+	maxOps      = 10500
 )
 
 func registerCDCMixedVersions(r registry.Registry) {
@@ -81,6 +89,7 @@ type cdcMixedVersionTester struct {
 	validator       *cdctest.CountValidator
 	validatorDone   chan struct{} // validator is no longer waiting for messages
 	validatorStop   bool          // used  to tell the validator to stop validating messages
+	workloadDone    chan struct{}
 	cleanup         func()
 }
 
@@ -100,6 +109,7 @@ func newCDCMixedVersionTester(
 		kafkaNodes:    lastNode,
 		monitor:       c.NewMonitor(ctx, crdbNodes),
 		validatorDone: make(chan struct{}),
+		workloadDone:  make(chan struct{}),
 	}
 }
 
@@ -125,12 +135,16 @@ func (cmvt *cdcMixedVersionTester) Cleanup() {
 func (cmvt *cdcMixedVersionTester) installAndStartWorkload() versionStep {
 	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
 		t.Status("installing and running workload")
-		u.c.Run(ctx, cmvt.workloadNodes, "./workload init bank {pgurl:1}")
+		u.c.Run(ctx, cmvt.workloadNodes, fmt.Sprintf("./workload init bank --seed %d {pgurl:1}", seed))
 		cmvt.monitor.Go(func(ctx context.Context) error {
+			defer close(cmvt.workloadDone)
 			return u.c.RunE(
 				ctx,
 				cmvt.workloadNodes,
-				fmt.Sprintf("./workload run bank {pgurl%s} --max-rate=10 --tolerate-errors", cmvt.crdbNodes),
+				fmt.Sprintf(
+					"./workload run bank {pgurl%s} --max-rate=10 --seed %d --concurrency %d --max-ops %d --tolerate-errors",
+					cmvt.crdbNodes, seed, concurrency, maxOps,
+				),
 			)
 		})
 	}
@@ -177,6 +191,14 @@ func (cmvt *cdcMixedVersionTester) waitForResolvedTimestamps() versionStep {
 // connection while the validator is still trying to use it
 func (cmvt *cdcMixedVersionTester) waitForValidator() versionStep {
 	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
+		t.L().Printf("waiting for workload to finish...")
+		<-cmvt.workloadDone
+		t.L().Printf("workload to finished")
+
+		// wait for remaining updates from workload to propagate to the
+		// validator
+		time.Sleep(3 * time.Minute)
+
 		cmvt.validatorStop = true
 		<-cmvt.validatorDone
 	}
@@ -210,7 +232,10 @@ func (cmvt *cdcMixedVersionTester) setupVerifier(node int) versionStep {
 			}
 
 			getConn := func(node int) *gosql.DB { return u.conn(ctx, t, node) }
-			fprintV, err := cdctest.NewFingerprintValidator(cmvt.cdcDBConn(getConn), tableName, `fprint`, consumer.partitions, 0)
+			onFirstFailure := func(ts hlc.Timestamp, context string, history []hlc.Timestamp, row string) {
+				cmvt.dumpTables(t, db, &ts, context, row, history, "first_failure")
+			}
+			fprintV, err := cdctest.NewFingerprintValidator(cmvt.cdcDBConn(getConn), tableName, `fprint`, consumer.partitions, 0, onFirstFailure, t.L().Printf)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -324,6 +349,70 @@ func (cmvt *cdcMixedVersionTester) createChangeFeed(node int) versionStep {
 	}
 }
 
+func (cmvt *cdcMixedVersionTester) dumpTables(t test.Test, db *gosql.DB, ts *hlc.Timestamp, context, row string, history []hlc.Timestamp, prefix string) {
+	suffix := fmt.Sprintf("%d", rand.Int())
+	for _, table := range []string{"bank.bank", "fprint"} {
+		var aost string
+		// we just want to do the AOST query for the table being updated
+		// by the workload
+		if ts != nil && table == "bank.bank" {
+			aost = fmt.Sprintf(" AS OF SYSTEM TIME '%s'", ts.AsOfSystemTime())
+			tsHist := make([]string, 0, len(history))
+			for _, t := range history {
+				tsHist = append(tsHist, t.AsOfSystemTime())
+			}
+			if row != "" || len(tsHist) > 0 || context != "" {
+				t.L().Printf("Row: %s", row)
+				t.L().Printf("(%s) History:\n%v", context, tsHist)
+			}
+		}
+		query := fmt.Sprintf("SELECT id, balance, payload FROM %s%s ORDER BY id", table, aost)
+
+		f, err := os.Create(fmt.Sprintf("/tmp/%s_%s_%s.json", prefix, table, suffix))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		t.L().Printf("[destination: %s] query: %q", f.Name(), query)
+
+		type bankRow struct {
+			ID      int    `json:"id"`
+			Balance int    `json:"balance"`
+			Payload string `json:"payload"`
+		}
+
+		rows, err := db.Query(query)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		encoder := json.NewEncoder(f)
+		for rows.Next() {
+			var row bankRow
+			if err := rows.Scan(&row.ID, &row.Balance, &row.Payload); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := encoder.Encode(row); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func (cmvt *cdcMixedVersionTester) maybeDumpTables() versionStep {
+	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
+		if len(cmvt.validator.Failures()) > 0 {
+			db := u.conn(ctx, t, 1)
+			cmvt.dumpTables(t, db, nil, "", "", nil, "final")
+		}
+	}
+}
+
 func runCDCMixedVersions(
 	ctx context.Context, t test.Test, c cluster.Cluster, buildVersion version.Version,
 ) {
@@ -366,18 +455,16 @@ func runCDCMixedVersions(
 		// let the workload run in the new version for a while
 		tester.waitForResolvedTimestamps(),
 
-		tester.assertValid(),
-
 		// Roll back again, which ought to be fine because the cluster upgrade was
 		// not finalized.
 		tester.crdbUpgradeStep(binaryUpgradeStep(tester.crdbNodes, mainVersion)),
 		tester.waitForResolvedTimestamps(),
 
-		tester.assertValid(),
 		waitForUpgradeStep(tester.crdbNodes),
 
 		tester.waitForResolvedTimestamps(),
 		tester.waitForValidator(),
+		tester.maybeDumpTables(),
 		tester.assertValid(),
 	).run(ctx, t)
 }

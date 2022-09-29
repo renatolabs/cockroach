@@ -414,7 +414,7 @@ func runCDCBank(ctx context.Context, t test.Test, c cluster.Cluster) {
 		}
 
 		withSQLDB := cdctest.WithDBConnection(db)
-		fprintV, err := cdctest.NewFingerprintValidator(withSQLDB, `bank.bank`, `fprint`, tc.partitions, 0)
+		fprintV, err := cdctest.NewFingerprintValidator(withSQLDB, `bank.bank`, `fprint`, tc.partitions, 0, nil, nil)
 		if err != nil {
 			return errors.Wrap(err, "error creating validator")
 		}
