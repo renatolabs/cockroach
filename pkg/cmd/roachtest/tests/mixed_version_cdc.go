@@ -23,7 +23,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
-	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
@@ -281,62 +281,10 @@ func (cmvt *cdcMixedVersionTester) createChangeFeed(node int) versionStep {
 func runCDCMixedVersions(
 	ctx context.Context, t test.Test, c cluster.Cluster, buildVersion version.Version,
 ) {
-	predecessorVersion, err := PredecessorVersion(buildVersion)
-	if err != nil {
-		t.Fatal(err)
-	}
+	crdbNodes := c.Range(1, c.Spec().NodeCount)
+	c.Put(ctx, t.Cockroach(), "./cockroach", crdbNodes)
+	c.Start(ctx, t.L(), option.DefaultStartOpts(), install.MakeClusterSettings(), crdbNodes)
 
-	tester := newCDCMixedVersionTester(ctx, t, c)
-	tester.StartKafka(t, c)
-	defer tester.Cleanup()
-
-	rng, seed := randutil.NewPseudoRand()
-	t.L().Printf("random seed: %d", seed)
-
-	// sqlNode returns the node to be used when sending SQL statements
-	// during this test. It is randomized, but the random seed is logged
-	// above.
-	sqlNode := func() int {
-		return tester.crdbNodes[rng.Intn(len(tester.crdbNodes))]
-	}
-
-	// An empty string will lead to the cockroach binary specified by flag
-	// `cockroach` to be used.
-	const mainVersion = ""
-	newVersionUpgradeTest(c,
-		uploadAndStartFromCheckpointFixture(tester.crdbNodes, predecessorVersion),
-		tester.setupVerifier(sqlNode()),
-		tester.installAndStartWorkload(),
-		waitForUpgradeStep(tester.crdbNodes),
-
-		// NB: at this point, cluster and binary version equal predecessorVersion,
-		// and auto-upgrades are on.
-		preventAutoUpgradeStep(sqlNode()),
-		tester.createChangeFeed(sqlNode()),
-
-		tester.waitForResolvedTimestamps(),
-		// Roll the nodes into the new version one by one in random order
-		binaryUpgradeStep(tester.crdbNodes, mainVersion),
-		// let the workload run in the new version for a while
-		tester.waitForResolvedTimestamps(),
-
-		tester.assertValid(),
-
-		// Roll back again, which ought to be fine because the cluster upgrade was
-		// not finalized.
-		binaryUpgradeStep(tester.crdbNodes, predecessorVersion),
-		tester.waitForResolvedTimestamps(),
-
-		tester.assertValid(),
-
-		// Roll nodes forward and finalize upgrade.
-		binaryUpgradeStep(tester.crdbNodes, mainVersion),
-
-		// allow cluster version to update
-		allowAutoUpgradeStep(sqlNode()),
-		waitForUpgradeStep(tester.crdbNodes),
-
-		tester.waitForResolvedTimestamps(),
-		tester.assertValid(),
-	).run(ctx, t)
+	c.Run(ctx, c.Node(crdbNodes[0]), "avocado")
+	t.L().Printf("success!")
 }
