@@ -93,6 +93,8 @@ func DefaultEnvVars() []string {
 		// the tests will fail even on release branches when attempting to upgrade previous (stable) release to an alpha.
 		// [1] https://github.com/cockroachdb/cockroach/pull/87468
 		"COCKROACH_UPGRADE_TO_DEV_VERSION=true",
+
+		"PRINT_CALLER_ON_EXIT=true",
 	}
 }
 

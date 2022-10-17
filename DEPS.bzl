@@ -1421,15 +1421,18 @@ def go_deps():
         ],
         build_file_proto_mode = "disable_global",
         importpath = "github.com/cockroachdb/pebble",
+        remote = "https://github.com/renatolabs/pebble",
         patch_args = ["-p1"],
         patches = [
             "@com_github_cockroachdb_cockroach//build/patches:com_github_cockroachdb_pebble.patch",
         ],
-        sha256 = "a1a2227e4b2869e50bc5aad003f1d4757ae5594ed00e3b45b2619aa0d878c532",
-        strip_prefix = "github.com/cockroachdb/pebble@v0.0.0-20221014163543-7e037ade079a",
-        urls = [
-            "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/pebble/com_github_cockroachdb_pebble-v0.0.0-20221014163543-7e037ade079a.zip",
-        ],
+        # sha256 = "a1a2227e4b2869e50bc5aad003f1d4757ae5594ed00e3b45b2619aa0d878c532",
+        vcs = "git",
+        commit = "f22bcb1263c0ecd948575c47ee095be1b36863b7",
+        # strip_prefix = "github.com/cockroachdb/pebble@v0.0.0-20221014163543-7e037ade079a",
+        # urls = [
+        #     "https://storage.googleapis.com/cockroach-godeps/gomod/github.com/cockroachdb/pebble/com_github_cockroachdb_pebble-v0.0.0-20221014163543-7e037ade079a.zip",
+        # ],
     )
     go_repository(
         name = "com_github_cockroachdb_redact",

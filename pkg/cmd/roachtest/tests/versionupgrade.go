@@ -480,6 +480,7 @@ func preventAutoUpgradeStep(node int) versionStep {
 
 func allowAutoUpgradeStep(node int) versionStep {
 	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
+		time.Sleep(7 * time.Minute)
 		db := u.conn(ctx, t, node)
 		_, err := db.ExecContext(ctx, `RESET CLUSTER SETTING cluster.preserve_downgrade_option`)
 		if err != nil {
@@ -525,6 +526,16 @@ func waitForUpgradeStep(nodes option.NodeListOption) versionStep {
 func setClusterSettingVersionStep(ctx context.Context, t test.Test, u *versionUpgradeTest) {
 	db := u.conn(ctx, t, 1)
 	t.L().Printf("bumping cluster version")
+	/* go func() {
+		rand.Seed(timeutil.Now().UnixNano())
+		wait := time.Duration(rand.Intn(5) + 10)
+		time.Sleep(wait * time.Second)
+
+		n := u.c.Range(1, 4).RandNode()
+		t.L().Printf("breaking pebble (node %d)", n[0])
+		u.c.Run(ctx, n, "touch /tmp/break_pebble")
+		t.L().Printf("done")
+	}()*/
 	// TODO(tbg): once this is using a job, poll and periodically print the job status
 	// instead of blocking.
 	if _, err := db.ExecContext(
@@ -686,6 +697,10 @@ func importTPCCStep(
 	oldV string, headroomWarehouses int, crdbNodes option.NodeListOption,
 ) versionStep {
 	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
+		if t.SkipInit() {
+			t.L().Printf("skipping importTPCCStep")
+			return
+		}
 		// We need to use the predecessor binary to load into the
 		// predecessor cluster to avoid random breakage. For example, you
 		// can't use 21.1 to import into 20.2 due to some flag changes.
@@ -710,6 +725,10 @@ func importTPCCStep(
 
 func importLargeBankStep(oldV string, rows int, crdbNodes option.NodeListOption) versionStep {
 	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
+		if t.SkipInit() {
+			t.L().Printf("skipping importLargeBankStep")
+			return
+		}
 		// Use the predecessor binary to load into the predecessor
 		// cluster to avoid random breakage due to flag changes, etc.
 		binary := "./cockroach"

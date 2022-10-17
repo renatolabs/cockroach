@@ -47,6 +47,7 @@ if [[ -n "${LOCAL}" || "${1-}" == "run" ]]; then
   export "${ENV_VARS[@]}"
   CODE=0
   "${BINARY}" "${ARGS[@]}" >> "${LOG_DIR}/cockroach.stdout.log" 2>> "${LOG_DIR}/cockroach.stderr.log" || CODE="$?"
+  echo "binary is ${BINARY}" | tee -a "${LOG_DIR}"/{roachprod,cockroach.std{out,err}}.log
   if [[ -z "${LOCAL}" || "${CODE}" -ne 0 ]]; then
     echo "cockroach exited with code ${CODE}: $(date)" | tee -a "${LOG_DIR}"/{roachprod,cockroach.{exit,std{out,err}}}.log
   fi

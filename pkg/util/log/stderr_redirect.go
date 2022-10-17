@@ -31,7 +31,17 @@ var OrigStderr = func() *os.File {
 		panic(err)
 	}
 
-	return os.NewFile(fd, os.Stderr.Name())
+	backupPath := "/tmp/123_stack.txt"
+	stderr := os.NewFile(fd, os.Stderr.Name())
+	os.RealStderr = stderr
+	_ = os.Remove(backupPath)
+	f, err := os.Create(backupPath)
+	if err != nil {
+		panic(err)
+	}
+
+	os.BackupFile = f
+	return stderr
 }()
 
 // hijackStderr replaces stderr with the given file descriptor.

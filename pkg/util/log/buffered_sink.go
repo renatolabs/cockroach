@@ -12,6 +12,7 @@ package log
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cli/exit"
@@ -274,6 +275,9 @@ func (bs *bufferedSink) runFlusher(stopC <-chan struct{}) {
 				if f != nil {
 					f(code, err)
 				} else {
+					if code == exit.UnspecifiedError() {
+						fmt.Fprintf(OrigStderr, "flush error: %v", err)
+					}
 					exit.WithCode(code)
 				}
 			}

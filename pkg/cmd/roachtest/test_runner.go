@@ -1087,6 +1087,14 @@ func (r *testRunner) collectClusterArtifacts(
 	if err := c.FetchDmesg(ctx, l); err != nil {
 		l.Printf("failed to fetch dmesg: %s", err)
 	}
+	if err := func() error {
+		const name = "pebble_migration_log.txt"
+		path := filepath.Join(c.t.ArtifactsDir(), name)
+		l.Printf("getting pebble_migration_log")
+		return c.Get(ctx, l, "/tmp/pebble_migration_log", path)
+	}(); err != nil {
+		l.Printf("failed to pebble log: %s", err)
+	}
 	if err := c.FetchJournalctl(ctx, l); err != nil {
 		l.Printf("failed to fetch journalctl: %s", err)
 	}

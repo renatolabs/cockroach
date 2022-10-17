@@ -367,7 +367,7 @@ func registerTPCC(r registry.Registry) {
 			})
 		},
 	})
-	mixedHeadroomSpec := r.MakeClusterSpec(5, spec.CPU(16), spec.RandomlyUseZfs())
+	mixedHeadroomSpec := r.MakeClusterSpec(5, spec.CPU(16), spec.SetFileSystem(spec.Zfs))
 
 	r.Add(registry.TestSpec{
 		// mixed-headroom is similar to w=headroom, but with an additional
@@ -380,7 +380,7 @@ func registerTPCC(r registry.Registry) {
 		// buggy.
 		Tags:              []string{`default`},
 		Cluster:           mixedHeadroomSpec,
-		EncryptionSupport: registry.EncryptionMetamorphic,
+		EncryptionSupport: registry.EncryptionAlwaysDisabled,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			if runtime.GOARCH == "arm64" {
 				t.Skip("Skip under ARM64. See https://github.com/cockroachdb/cockroach/issues/89268")
@@ -401,9 +401,10 @@ func registerTPCC(r registry.Registry) {
 					const duration = 120 * time.Minute
 					t.L().Printf("running background TPCC workload")
 					runTPCC(ctx, t, c, tpccOptions{
-						Warehouses: headroomWarehouses,
-						Duration:   duration,
-						SetupType:  usingExistingData,
+						Warehouses:        headroomWarehouses,
+						Duration:          duration,
+						SetupType:         usingExistingData,
+						DisablePrometheus: true,
 						Start: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 							// Noop - we don't let tpcc upload or start binaries in this test.
 						},
@@ -419,10 +420,10 @@ func registerTPCC(r registry.Registry) {
 			// have settled down, and ~7.5k ranges. The import takes ~40 minutes.
 			// The full 6.5m import ran into out of disk errors (on 250gb machines),
 			// hence division by two.
-			bankRows := 65104166 / 2
-			if c.IsLocal() {
-				bankRows = 1000
-			}
+			// bankRows := 65104166 / 2
+			// if c.IsLocal() {
+			// 	bankRows = 1000
+			// }
 
 			oldV, err := PredecessorVersion(*t.BuildVersion())
 			if err != nil {
@@ -430,7 +431,8 @@ func registerTPCC(r registry.Registry) {
 			}
 
 			newVersionUpgradeTest(c,
-				uploadAndStartFromCheckpointFixture(crdbNodes, oldV),
+				// uploadAndStartFromCheckpointFixture(crdbNodes, oldV),
+				uploadAndStart(crdbNodes, oldV),
 				waitForUpgradeStep(crdbNodes), // let predecessor version settle (gossip etc)
 				preventAutoUpgradeStep(n1),
 				// Load TPCC dataset, don't run TPCC yet. We do this while in the old
@@ -440,11 +442,11 @@ func registerTPCC(r registry.Registry) {
 				// Add a lot of cold data to this cluster. This further stresses the version
 				// upgrade machinery, in which a) all ranges are touched and b) work proportional
 				// to the amount data may be carried out.
-				importLargeBankStep(oldV, bankRows, crdbNodes),
+				// importLargeBankStep(oldV, bankRows, crdbNodes),
 				// Upload and restart cluster into the new
 				// binary (stays at old cluster version).
-				binaryUpgradeStep(crdbNodes, mainBinary),
 				uploadVersionStep(workloadNode, mainBinary), // for tpccBackgroundStepper's workload
+				binaryUpgradeStep(crdbNodes, mainBinary),
 				// Now start running TPCC in the background.
 				tpccBackgroundStepper.launch,
 				// While tpcc is running in the background, bump the cluster
@@ -455,8 +457,12 @@ func registerTPCC(r registry.Registry) {
 				setClusterSettingVersionStep,
 				// Wait until TPCC background run terminates
 				// and fail if it reports an error.
-				tpccBackgroundStepper.wait,
+				// tpccBackgroundStepper.wait,
 			).run(ctx, t)
+
+			// if !t.Failed() {
+			// 	t.Fatal("test would have passed")
+			// }
 		},
 	})
 	r.Add(registry.TestSpec{

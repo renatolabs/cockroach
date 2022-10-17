@@ -726,6 +726,7 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 			if len(spec.RocksDBOptions) > 0 {
 				return nil, errors.Errorf("store %d: using Pebble storage engine but StoreSpec provides RocksDB options", i)
 			}
+			log.Infof(ctx, "creating server pebble engine")
 			eng, err := storage.NewPebble(ctx, pebbleConfig)
 			if err != nil {
 				return Engines{}, err

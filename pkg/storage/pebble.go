@@ -853,7 +853,7 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (p *Pebble, err error) {
 	logCtx = logtags.AddTag(logCtx, "s", storeIDContainer)
 	logCtx = logtags.AddTag(logCtx, "pebble", nil)
 
-	if cfg.Opts.Logger == nil {
+	if cfg.Opts.Logger == nil || cfg.Opts.Logger == pebble.DefaultLogger {
 		cfg.Opts.Logger = pebbleLogger{
 			ctx:   logCtx,
 			depth: 1,
@@ -883,6 +883,8 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (p *Pebble, err error) {
 
 	storeProps := computeStoreProperties(ctx, cfg.Dir, cfg.Opts.ReadOnly, env != nil /* encryptionEnabled */)
 
+	log.Infof(ctx, "pebble created, default log")
+	cfg.Opts.Logger.Infof("pebble just created, storage channel?")
 	p = &Pebble{
 		readOnly:         cfg.Opts.ReadOnly,
 		path:             cfg.Dir,
