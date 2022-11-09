@@ -65,6 +65,30 @@ func registerCDCMixedVersions(r registry.Registry) {
 	})
 }
 
+func registerSimpleSSHTest(r registry.Registry) {
+	r.Add(registry.TestSpec{
+		Name:    "ssh/retry-test",
+		Owner:   registry.OwnerTestEng,
+		Cluster: r.MakeClusterSpec(3),
+		// Timeout:         timeout,
+		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
+			cmd := `
+RNG=$(((RANDOM % 10) + 1))
+if [ $RNG -lt 5 ]; then
+    exit 255
+elif [ $RNG -lt 8 ]; then
+    exit 1
+else
+    exit 0
+fi
+`
+			for _, n := range c.Range(1, c.Spec().NodeCount) {
+				c.Run(ctx, c.Node(n), cmd)
+			}
+		},
+	})
+}
+
 // cdcMixedVersionTester implements mixed-version/upgrade testing for
 // CDC. It knows how to set up the cluster to run Kafka, monitor
 // events, and run validations that ensure changefeeds work during and
