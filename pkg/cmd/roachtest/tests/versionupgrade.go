@@ -14,7 +14,6 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
-	"math/rand"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -323,65 +322,10 @@ func uploadAndStart(nodes option.NodeListOption, v string) versionStep {
 // Use a waitForUpgradeStep() for that.
 func binaryUpgradeStep(nodes option.NodeListOption, newVersion string) versionStep {
 	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
-		upgradeNodes(ctx, nodes, option.DefaultStartOpts(), newVersion, t, u.c)
+		upgrades.upgradeNodes(ctx, nodes, option.DefaultStartOpts(), newVersion, t, u.c, t.L())
 		// TODO(nvanbenschoten): add upgrade qualification step. What should we
 		// test? We could run logictests. We could add custom logic here. Maybe
 		// this should all be pushed to nightly migration tests instead.
-	}
-}
-
-func upgradeNodes(
-	ctx context.Context,
-	nodes option.NodeListOption,
-	startOpts option.StartOpts,
-	newVersion string,
-	t test.Test,
-	c cluster.Cluster,
-) {
-	// NB: We could technically stage the binary on all nodes before
-	// restarting each one, but on Unix it's invalid to write to an
-	// executable file while it is currently running. So we do the
-	// simple thing and upload it serially instead.
-
-	// Restart nodes in a random order; otherwise node 1 would be running all
-	// the migrations and it probably also has all the leases.
-	rand.Shuffle(len(nodes), func(i, j int) {
-		nodes[i], nodes[j] = nodes[j], nodes[i]
-	})
-	for _, node := range nodes {
-		v := newVersion
-		if v == "" {
-			v = "<latest>"
-		}
-		newVersionMsg := newVersion
-		if newVersion == "" {
-			newVersionMsg = "<current>"
-		}
-		t.L().Printf("restarting node %d into version %s", node, newVersionMsg)
-		// Stop the cockroach process gracefully in order to drain it properly.
-		// This makes the upgrade closer to how users do it in production, but
-		// it's also needed to eliminate flakiness. In particular, this will
-		// make sure that DistSQL draining information is dissipated through
-		// gossip so that other nodes running an older version don't consider
-		// this upgraded node for DistSQL plans (see #87154 for more details).
-		// TODO(yuzefovich): ideally, we would also check that the drain was
-		// successful since if it wasn't, then we might see flakes too.
-		if err := c.StopCockroachGracefullyOnNode(ctx, t.L(), node); err != nil {
-			t.Fatal(err)
-		}
-
-		binary := uploadVersion(ctx, t, c, c.Node(node), newVersion)
-		settings := install.MakeClusterSettings(install.BinaryOption(binary))
-		c.Start(ctx, t.L(), startOpts, settings, c.Node(node))
-
-		// We have seen cases where a transient error could occur when this
-		// newly upgraded node serves as a gateway for a distributed query due
-		// to remote nodes not being able to dial back to the gateway for some
-		// reason (investigation of it is tracked in #87634). For now, we're
-		// papering over these flakes by this sleep. For more context, see
-		// #87104.
-		// TODO(yuzefovich): remove this sleep once #87634 is fixed.
-		time.Sleep(4 * time.Second)
 	}
 }
 

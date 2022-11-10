@@ -145,7 +145,9 @@ func (mvt *MixedVersionTest) changeVersion(action string, version string) {
 	for _, node := range mvt.crdbNodes { // TODO: randomize
 		mvt.logger.Printf("%s node %d", action, node)
 		nodes := option.NodeListOption{node}
-		upgradeNodes(mvt.ctx, nodes, option.DefaultStartOpts(), version, mvt.t, mvt.cluster)
+		upgrades.upgradeNodes(
+			mvt.ctx, nodes, option.DefaultStartOpts(), version, mvt.t, mvt.cluster, mvt.logger,
+		)
 
 		mvt.refreshBinaryVersions()
 		mvt.runHooks(targetVersion)
