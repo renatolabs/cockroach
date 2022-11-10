@@ -24,7 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
-	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
@@ -124,55 +124,37 @@ func (cmvt *cdcMixedVersionTester) Cleanup() {
 	}
 }
 
-// installAndStartWorkload starts a bank workload asynchronously
-func (cmvt *cdcMixedVersionTester) installAndStartWorkload() versionStep {
-	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
-		t.Status("installing and running workload")
-		u.c.Run(ctx, cmvt.workloadNodes, "./workload init bank {pgurl:1}")
-		cmvt.monitor.Go(func(ctx context.Context) error {
-			return u.c.RunE(
-				ctx,
-				cmvt.workloadNodes,
-				fmt.Sprintf("./workload run bank {pgurl%s} --max-rate=10 --tolerate-errors",
-					cmvt.crdbNodes),
-			)
-		})
-	}
-}
-
 // waitForResolvedTimestamps waits for the underlying CDC verifier to
 // resolve `resolvedTimestampsPerState`
-func (cmvt *cdcMixedVersionTester) waitForResolvedTimestamps() versionStep {
-	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
-		t.Status(fmt.Sprintf("waiting for %d resolved timestamps", resolvedTimestampsPerState))
-		// create a new channel for the resolved timestamps, allowing any
-		// new resolved timestamps to be captured and account for in the
-		// loop below
-		func() {
-			cmvt.timestampsResolved.Lock()
-			defer cmvt.timestampsResolved.Unlock()
+func (cmvt *cdcMixedVersionTester) waitForResolvedTimestamps(l *logger.Logger) {
+	l.Printf("waiting for %d resolved timestamps", resolvedTimestampsPerState)
+	// create a new channel for the resolved timestamps, allowing any
+	// new resolved timestamps to be captured and account for in the
+	// loop below
+	func() {
+		cmvt.timestampsResolved.Lock()
+		defer cmvt.timestampsResolved.Unlock()
 
-			cmvt.timestampsResolved.C = make(chan struct{})
-		}()
+		cmvt.timestampsResolved.C = make(chan struct{})
+	}()
 
-		var resolved int
-		for range cmvt.timestampsResolved.C {
-			resolved++
-			t.L().Printf("%d of %d timestamps resolved", resolved, resolvedTimestampsPerState)
-			if resolved == resolvedTimestampsPerState {
-				break
-			}
+	var resolved int
+	for range cmvt.timestampsResolved.C {
+		resolved++
+		l.Printf("%d of %d timestamps resolved", resolved, resolvedTimestampsPerState)
+		if resolved == resolvedTimestampsPerState {
+			break
 		}
-
-		// set the resolved timestamps channel back to `nil`; while in
-		// this state, any new resolved timestamps will be ignored
-		func() {
-			cmvt.timestampsResolved.Lock()
-			defer cmvt.timestampsResolved.Unlock()
-
-			cmvt.timestampsResolved.C = nil
-		}()
 	}
+
+	// set the resolved timestamps channel back to `nil`; while in
+	// this state, any new resolved timestamps will be ignored
+	func() {
+		cmvt.timestampsResolved.Lock()
+		defer cmvt.timestampsResolved.Unlock()
+
+		cmvt.timestampsResolved.C = nil
+	}()
 }
 
 // finishTest marks the test as finished which will then prompt the
@@ -180,12 +162,10 @@ func (cmvt *cdcMixedVersionTester) waitForResolvedTimestamps() versionStep {
 // validator has finished; this is done to avoid the possibility of
 // the test closing the database connection while the validator is
 // running a query.
-func (cmvt *cdcMixedVersionTester) finishTest() versionStep {
-	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
-		t.L().Printf("waiting for background tasks to finish")
-		cmvt.testFinished = true
-		<-cmvt.validatorFinished
-	}
+func (cmvt *cdcMixedVersionTester) finishTest(l *logger.Logger) {
+	l.Printf("waiting for background tasks to finish")
+	cmvt.testFinished = true
+	<-cmvt.validatorFinished
 }
 
 // setupVerifier creates a CDC validator to validate that a changefeed
@@ -193,10 +173,10 @@ func (cmvt *cdcMixedVersionTester) finishTest() versionStep {
 // somewhere else. It also verifies CDC's ordering guarantees. This
 // step will not block, but will start the verifier in a separate Go
 // routine. Use `waitForVerifier` to wait for the verifier to finish.
-func (cmvt *cdcMixedVersionTester) setupVerifier(node int) versionStep {
+func (cmvt *cdcMixedVersionTester) setupVerifier(l *logger.Logger) versionStep {
 	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
 		tableName := targetDB + "." + targetTable
-		t.Status(fmt.Sprintf("setting up changefeed verifier for table %s", tableName))
+		l.Printf("setting up changefeed verifier for table %s", tableName)
 
 		// we could just return the error here and let `Wait` return the
 		// error. However, calling t.Fatal directly lets us stop the test
@@ -209,7 +189,7 @@ func (cmvt *cdcMixedVersionTester) setupVerifier(node int) versionStep {
 			}
 			defer consumer.Close()
 
-			db := u.conn(ctx, t, node)
+			db := u.conn(ctx, t, cmvt.crdbNodes.RandNode()[0])
 			if _, err := db.Exec(
 				"CREATE TABLE fprint (id INT PRIMARY KEY, balance INT, payload STRING)",
 			); err != nil {
@@ -236,7 +216,7 @@ func (cmvt *cdcMixedVersionTester) setupVerifier(node int) versionStep {
 					// the test, it will eventually time out, and this message
 					// should allow us to see that the validator finished
 					// earlier than it should have
-					t.L().Printf("end of changefeed")
+					l.Printf("end of changefeed")
 					return nil
 				}
 
@@ -255,7 +235,7 @@ func (cmvt *cdcMixedVersionTester) setupVerifier(node int) versionStep {
 						t.Fatal(err)
 					}
 
-					t.L().Printf("%d resolved timestamps validated, latest is %s behind realtime",
+					l.Printf("%d resolved timestamps validated, latest is %s behind realtime",
 						cmvt.validator.NumResolvedWithRows, timeutil.Since(resolved.GoTime()))
 					cmvt.timestampResolved()
 				}
@@ -306,98 +286,86 @@ func (cmvt *cdcMixedVersionTester) crdbUpgradeStep(step versionStep) versionStep
 	}
 }
 
-// assertValid checks if the validator has found any issues at the
-// time the function is called.
-func (cmvt *cdcMixedVersionTester) assertValid() versionStep {
-	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
-		if failures := cmvt.validator.Failures(); len(failures) > 0 {
-			t.Fatalf("validator failures:\n%s", strings.Join(failures, "\n"))
-		}
+// validate checks if the validator has found any issues at the
+// time the function is called, returning a corresponding error.
+func (cmvt *cdcMixedVersionTester) validate() error {
+	if failures := cmvt.validator.Failures(); len(failures) > 0 {
+		return fmt.Errorf("validator failures:\n%s", strings.Join(failures, "\n"))
 	}
+
+	return nil
 }
 
 // createChangeFeed issues a call to the given node to create a change
 // feed for the target table.
-func (cmvt *cdcMixedVersionTester) createChangeFeed(node int) versionStep {
-	return func(ctx context.Context, t test.Test, u *versionUpgradeTest) {
-		t.Status("creating changefeed")
-		db := u.conn(ctx, t, node)
-
-		options := []cdcOption{
-			{"updated", ""},
-			{"resolved", fmt.Sprintf("'%s'", resolvedInterval)},
-		}
-		_, err := newChangefeedCreator(db, fmt.Sprintf("%s.%s", targetDB, targetTable), cmvt.kafka.sinkURL(ctx)).
-			With(options...).
-			Create()
-		if err != nil {
-			t.Fatal(err)
-		}
+func (cmvt *cdcMixedVersionTester) createChangeFeed(ctx context.Context, db *gosql.DB) error {
+	options := []cdcOption{
+		{"updated", ""},
+		{"resolved", fmt.Sprintf("'%s'", resolvedInterval)},
 	}
+	_, err := newChangefeedCreator(db, fmt.Sprintf("%s.%s", targetDB, targetTable), cmvt.kafka.sinkURL(ctx)).
+		With(options...).
+		Create()
+	return err
 }
 
 func runCDCMixedVersions(
 	ctx context.Context, t test.Test, c cluster.Cluster, buildVersion version.Version,
 ) {
-	predecessorVersion, err := PredecessorVersion(buildVersion)
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	tester := newCDCMixedVersionTester(ctx, t, c)
 	tester.StartKafka(t, c)
 	defer tester.Cleanup()
 
-	rng, seed := randutil.NewPseudoRand()
-	t.L().Printf("random seed: %d", seed)
+	mvt := NewMixedVersionTest(ctx, t, c, tester.crdbNodes)
+	workloadInitialized := make(chan struct{})
 
-	// sqlNode returns the node to be used when sending SQL statements
-	// during this test. It is randomized, but the random seed is logged
-	// above.
-	sqlNode := func() int {
-		return tester.crdbNodes[rng.Intn(len(tester.crdbNodes))]
+	mvt.OnStartup("setup verifier", func(ctx context.Context, l *logger.Logger) error {
+		<-workloadInitialized
+		mvt.step(tester.setupVerifier(l))
+		return nil
+	})
+
+	mvt.OnStartup("create changefeed", func(ctx context.Context, l *logger.Logger) error {
+		<-workloadInitialized
+		db := mvt.legacyUpgrade.conn(ctx, t, tester.crdbNodes.RandNode()[0])
+		return tester.createChangeFeed(ctx, db)
+	})
+
+	mvt.OnStartup("run workload", func(ctx context.Context, l *logger.Logger) error {
+		initCmd := "./workload init bank {pgurl:1}"
+		l.Printf("initializing workload with command: `%s`", initCmd)
+		if err := c.RunE(ctx, tester.workloadNodes, initCmd); err != nil {
+			return err
+		}
+		close(workloadInitialized)
+
+		tester.monitor.Go(func(ctx context.Context) error {
+			workloadCmd := fmt.Sprintf("./workload run bank {pgurl%s} --max-rate=10 --tolerate-errors",
+				tester.crdbNodes)
+			l.Printf("starting bank workload with command: `%s`", workloadCmd)
+			return c.RunE(
+				ctx,
+				tester.workloadNodes,
+				workloadCmd,
+			)
+		})
+
+		return nil
+	})
+
+	mvt.InMixedVersion("wait for resolved messages", func(ctx context.Context, l *logger.Logger) error {
+		tester.waitForResolvedTimestamps(l)
+		return tester.validate()
+	})
+
+	mvt.Run()
+
+	// wait for a final set of resolved timestamps after upgrade is
+	// finalized
+	logger := prefixedLogger(t, "after upgrade")
+	tester.waitForResolvedTimestamps(logger)
+	tester.finishTest(logger)
+	if err := tester.validate(); err != nil {
+		t.Fatal(err)
 	}
-
-	// mvt := NewMixedVersionTest(ctx, t, c)
-
-	// An empty string will lead to the cockroach binary specified by flag
-	// `cockroach` to be used.
-	const mainVersion = ""
-	newVersionUpgradeTest(c,
-		uploadAndStartFromCheckpointFixture(tester.crdbNodes, predecessorVersion),
-		tester.setupVerifier(sqlNode()),
-		tester.installAndStartWorkload(),
-		waitForUpgradeStep(tester.crdbNodes),
-
-		// NB: at this point, cluster and binary version equal predecessorVersion,
-		// and auto-upgrades are on.
-		preventAutoUpgradeStep(sqlNode()),
-		tester.createChangeFeed(sqlNode()),
-
-		tester.waitForResolvedTimestamps(),
-		// Roll the nodes into the new version one by one in random order
-		tester.crdbUpgradeStep(binaryUpgradeStep(tester.crdbNodes, mainVersion)),
-		// let the workload run in the new version for a while
-		tester.waitForResolvedTimestamps(),
-
-		tester.assertValid(),
-
-		// Roll back again, which ought to be fine because the cluster upgrade was
-		// not finalized.
-		tester.crdbUpgradeStep(binaryUpgradeStep(tester.crdbNodes, predecessorVersion)),
-		tester.waitForResolvedTimestamps(),
-
-		tester.assertValid(),
-
-		// Roll nodes forward and finalize upgrade.
-		tester.crdbUpgradeStep(binaryUpgradeStep(tester.crdbNodes, mainVersion)),
-
-		// allow cluster version to update
-		allowAutoUpgradeStep(sqlNode()),
-		waitForUpgradeStep(tester.crdbNodes),
-
-		tester.waitForResolvedTimestamps(),
-		tester.finishTest(),
-		tester.assertValid(),
-	).run(ctx, t)
 }
