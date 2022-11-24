@@ -255,6 +255,7 @@ func registerAutoUpgrade(r registry.Registry) {
 		Name:    `autoupgrade`,
 		Owner:   registry.OwnerKV,
 		Cluster: r.MakeClusterSpec(5),
+		Tags:    []string{"repro"},
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			if runtime.GOARCH == "arm64" {
 				t.Skip("Skip under ARM64. See https://github.com/cockroachdb/cockroach/issues/89268")
