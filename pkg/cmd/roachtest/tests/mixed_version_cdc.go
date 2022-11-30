@@ -398,4 +398,6 @@ func runCDCMixedVersions(
 		tester.finishTest(),
 		tester.assertValid(),
 	).run(ctx, t)
+
+	t.Fatal(fmt.Errorf("would have passed"))
 }
