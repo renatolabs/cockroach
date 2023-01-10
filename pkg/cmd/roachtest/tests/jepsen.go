@@ -268,6 +268,10 @@ func (j jepsenConfig) startTest(
 	ctx context.Context, t test.Test, run func(args ...string) error, testArgs string,
 ) <-chan error {
 	errCh := make(chan error, 1)
+	go func() {
+		time.Sleep(30 * time.Second)
+		t.Fatal("reproducing log fetching issues")
+	}()
 	if j.buildFromSource {
 		// Install the jepsen package (into ~/.m2) before running tests in
 		// the cockroach package. Clojure doesn't really understand
