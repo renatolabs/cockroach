@@ -102,6 +102,11 @@ func runVersionUpgrade(ctx context.Context, t test.Test, c cluster.Cluster) {
 	}
 
 	mvt := mixedversion.NewTest(ctx, t, t.L(), c, c.All())
+	mvt.InMixedVersion("force failure", func(l *logger.Logger, db *gosql.DB) error {
+		l.Printf("pretending to do some work...")
+		time.Sleep(500 * time.Millisecond)
+		return fmt.Errorf("something went wrong")
+	})
 	mvt.InMixedVersion("run backup", func(l *logger.Logger, db *gosql.DB) error {
 		// Verify that backups can be created in various configurations. This is
 		// important to test because changes in system tables might cause backups to
