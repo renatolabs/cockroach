@@ -47,7 +47,8 @@ type (
 )
 
 var (
-	invalidChars = regexp.MustCompile(`[^a-zA-Z0-9 \-_]`)
+	// everything that is not an alphanum or a few special characters
+	invalidChars = regexp.MustCompile(`[^a-zA-Z0-9 \-_\.]`)
 )
 
 func newTestRunner(
