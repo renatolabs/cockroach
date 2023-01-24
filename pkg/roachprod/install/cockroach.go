@@ -224,6 +224,14 @@ func (c *SyncedCluster) Start(ctx context.Context, l *logger.Logger, startOpts S
 	if startOpts.ScheduleBackups {
 		return c.createFixedBackupSchedule(ctx, l, startOpts.ScheduleBackupArgs)
 	}
+
+	doBogus := os.Getenv("GEN_BOGUS_SQL")
+	l.Printf("Bogus: %q", doBogus)
+	if doBogus == "true" {
+		bogusSQL := "CREATE foobar INTO whatever"
+		l.Printf("Runnig bogus: %q", bogusSQL)
+		return c.SQL(ctx, l, "" /* tenantName */, []string{bogusSQL})
+	}
 	return nil
 }
 
@@ -317,6 +325,7 @@ func (c *SyncedCluster) SQL(
 // RunSQL runs a `cockroach sql` command.
 // It is assumed that the args include the -e flag.
 func (c *SyncedCluster) RunSQL(ctx context.Context, l *logger.Logger, args []string) error {
+	l.Printf("In RunSQL: %v", args)
 	type result struct {
 		node   Node
 		output string
@@ -335,13 +344,17 @@ func (c *SyncedCluster) RunSQL(ctx context.Context, l *logger.Logger, args []str
 			c.NodeURL("localhost", c.NodePort(node), "" /* tenantName */) + " " +
 			ssh.Escape(args)
 
+		l.Printf("creating new session to run SQL")
 		sess := c.newSession(l, node, cmd, "run-sql")
 		defer sess.Close()
 
 		out, cmdErr := sess.CombinedOutput(ctx)
+		l.Printf("Getting combined output (err: %v)", cmdErr)
 		res := newRunResultDetails(node, cmdErr)
+		l.Printf("Got combined output")
 		res.CombinedOut = out
 
+		l.Printf("res.Err = %v", res.Err)
 		if res.Err != nil {
 			return res, errors.Wrapf(res.Err, "~ %s\n%s", cmd, res.CombinedOut)
 		}

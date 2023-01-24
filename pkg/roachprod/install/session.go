@@ -45,6 +45,7 @@ type remoteSession struct {
 	*exec.Cmd
 	cancel  func()
 	logfile string // captures ssh -vvv
+	logger  *logger.Logger
 }
 
 type remoteCommand struct {
@@ -53,6 +54,7 @@ type remoteCommand struct {
 	host      string
 	cmd       string
 	debugName string
+	logger    *logger.Logger
 }
 
 func newRemoteSession(l *logger.Logger, command remoteCommand) *remoteSession {
@@ -102,7 +104,7 @@ func newRemoteSession(l *logger.Logger, command remoteCommand) *remoteSession {
 	args = append(args, command.cmd)
 	ctx, cancel := context.WithCancel(context.Background())
 	fullCmd := exec.CommandContext(ctx, "ssh", args...)
-	return &remoteSession{fullCmd, cancel, logfile}
+	return &remoteSession{fullCmd, cancel, logfile, command.logger}
 }
 
 func (s *remoteSession) errWithDebug(err error) error {
@@ -117,9 +119,16 @@ func (s *remoteSession) CombinedOutput(ctx context.Context) ([]byte, error) {
 	var b []byte
 	var err error
 	commandFinished := make(chan struct{})
+	log := func(f string, args ...interface{}) {
+		if s.logger != nil {
+			s.logger.Printf(f, args...)
+		}
+	}
 
 	go func() {
+		log("getting remote session output")
 		b, err = s.Cmd.CombinedOutput()
+		log("result error: %v", err)
 		err = s.errWithDebug(err)
 		close(commandFinished)
 	}()
@@ -129,6 +138,9 @@ func (s *remoteSession) CombinedOutput(ctx context.Context) ([]byte, error) {
 		s.Close()
 		return nil, ctx.Err()
 	case <-commandFinished:
+		log("got commandFinished")
+		class := rperrors.ClassifyCmdError(err)
+		log("commandFinished classified error: %v", class)
 		return b, rperrors.ClassifyCmdError(err)
 	}
 }

@@ -305,6 +305,7 @@ func (c *SyncedCluster) newSession(
 		host:      c.Host(node),
 		cmd:       cmd,
 		debugName: cmdDebugName,
+		logger:    l,
 	}
 	return newRemoteSession(l, command)
 }
@@ -682,6 +683,9 @@ func newRunResultDetails(node Node, err error) *RunResultDetails {
 		Node: node,
 		Err:  err,
 	}
+	fmt.Fprintf(os.Stderr, "Getting exit code\n")
+	ec, s := rperrors.GetExitCode(err)
+	fmt.Fprintf(os.Stderr, "result: %d | %t\n", ec, s)
 	if exitCode, success := rperrors.GetExitCode(err); success {
 		res.RemoteExitStatus = exitCode
 	}
