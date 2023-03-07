@@ -80,13 +80,35 @@ type (
 		passphrase string
 	}
 
+	backupType interface {
+		BackupCommand() string
+		RestoreCommand(string) (string, []string)
+		TargetTables() []string
+	}
+
+	tableBackup struct {
+		db     string
+		target string
+	}
+
+	databaseBackup struct {
+		db     string
+		tables []string
+	}
+
+	clusterBackup struct {
+		db     string
+		tables []string
+	}
+
 	// backupCollection wraps a backup collection (which may or may not
 	// contain incremental backups). The associated fingerprint is the
 	// expected fingerprint when the corresponding table is restored.
 	backupCollection struct {
-		uri             string
-		dataFingerprint string
-		options         []backupOption
+		btype            backupType
+		uri              string
+		dataFingerprints []string
+		options          []backupOption
 	}
 
 	fullBackup struct {
@@ -111,6 +133,23 @@ type (
 		Execute labeledNodes
 	}
 )
+
+func tableNamesWithDB(db string, tables []string) []string {
+	names := make([]string, 0, len(tables))
+	for _, t := range tables {
+		parts := strings.Split(t, ".")
+		var tableName string
+		if len(parts) == 1 {
+			tableName = parts[0]
+		} else {
+			tableName = parts[1]
+		}
+
+		names = append(names, fmt.Sprintf("%s.%s", db, tableName))
+	}
+
+	return names
+}
 
 func (fb fullBackup) String() string        { return "full" }
 func (ib incrementalBackup) String() string { return "incremental" }
@@ -154,6 +193,65 @@ func newBackupOptions(rng *rand.Rand) []backupOption {
 	return options
 }
 
+func newTableBackup(rng *rand.Rand, db string, tables []string) *tableBackup {
+	target := tables[rng.Intn(len(tables))]
+	return &tableBackup{db, target}
+}
+
+func (tb *tableBackup) BackupCommand() string {
+	return fmt.Sprintf("BACKUP TABLE %s", tb.TargetTables()[0])
+}
+
+func (tb *tableBackup) RestoreCommand(uniqueName string) (string, []string) {
+	options := []string{
+		fmt.Sprintf("into_db = '%s'", uniqueName),
+	}
+
+	return fmt.Sprintf("RESTORE TABLE %s", tb.TargetTables()[0]), options
+}
+
+func (tb *tableBackup) TargetTables() []string {
+	return []string{fmt.Sprintf("%s.%s", tb.db, tb.target)}
+}
+
+func newDatabaseBackup(rng *rand.Rand, db string, tables []string) *databaseBackup {
+	return &databaseBackup{db, tables}
+}
+
+func (dbb *databaseBackup) BackupCommand() string {
+	return fmt.Sprintf("BACKUP DATABASE %s", dbb.db)
+}
+
+func (dbb *databaseBackup) RestoreCommand(uniqueName string) (string, []string) {
+	options := []string{
+		fmt.Sprintf("new_db_name = '%s'", uniqueName),
+	}
+
+	return fmt.Sprintf("RESTORE DATABASE %s", dbb.db), options
+}
+
+// TODO(renato): verify sample of crdb_internal tables
+func (dbb *databaseBackup) TargetTables() []string {
+	return tableNamesWithDB(dbb.db, dbb.tables)
+}
+
+func (cb *clusterBackup) BackupCommand() string                      { return "BACKUP" }
+func (cb *clusterBackup) RestoreCommand(_ string) (string, []string) { return "RESTORE", nil }
+
+// TODO(renato): verify sample of system tables
+func (cb *clusterBackup) TargetTables() []string {
+	return tableNamesWithDB(cb.db, cb.tables)
+}
+
+func newBackupType(rng *rand.Rand, db string, tables []string) backupType {
+	possibleTypes := []backupType{
+		newTableBackup(rng, db, tables),
+		// databaseBackup, clusterBackup, // TODO(renato): support other types
+	}
+
+	return possibleTypes[rng.Intn(len(possibleTypes))]
+}
+
 // backupCollectionDesc builds a string that describes how a backup
 // collection comprised of a full backup and a follow-up incremental
 // backup was generated (in terms of which versions planned vs
@@ -181,17 +279,18 @@ type mixedVersionBackup struct {
 	roachNodes option.NodeListOption
 	// backup collections that are created along the test
 	collections []*backupCollection
-	// the table being backed up/restored
-	table string
+	// the db being backed up/restored
+	db     string
+	tables []string
 	// counter that is incremented atomically to provide unique
 	// identifiers to backups created during the test
 	currentBackupID int64
 }
 
 func newMixedVersionBackup(
-	c cluster.Cluster, roachNodes option.NodeListOption, table string,
+	c cluster.Cluster, roachNodes option.NodeListOption, db string,
 ) *mixedVersionBackup {
-	mvb := &mixedVersionBackup{cluster: c, table: table, roachNodes: roachNodes}
+	mvb := &mixedVersionBackup{cluster: c, db: db, roachNodes: roachNodes}
 	return mvb
 }
 
@@ -204,6 +303,30 @@ func (*mixedVersionBackup) setShortJobIntervals(
 	return setShortJobIntervalsCommon(func(query string, args ...interface{}) error {
 		return h.Exec(rng, query, args...)
 	})
+}
+
+func (mvb *mixedVersionBackup) loadTables(
+	ctx context.Context, l *logger.Logger, rng *rand.Rand, h *mixedversion.Helper,
+) error {
+	node, db := h.RandomDB(rng, mvb.roachNodes)
+	l.Printf("loading table information for DB %q via node %d", mvb.db, node)
+	query := fmt.Sprintf("SELECT table_name FROM [SHOW TABLES FROM %s]", mvb.db)
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		return fmt.Errorf("failed to read tables for database %s: %w", mvb.db, err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return fmt.Errorf("error scanning table_name for db %s: %w", mvb.db, err)
+		}
+		mvb.tables = append(mvb.tables, name)
+	}
+
+	l.Printf("database %q has %d tables", mvb.db, len(mvb.tables))
+	return nil
 }
 
 // loadBackupData starts a CSV server in the background and runs
@@ -251,7 +374,11 @@ func (mvb *mixedVersionBackup) loadBackupData(
 		importBankCommand(currentRoach, rows, 0 /* ranges */, csvPort, importNode),
 	)
 	stopCSVServer()
-	return err
+
+	if err != nil {
+		return err
+	}
+	return mvb.loadTables(ctx, l, rng, h)
 }
 
 // randomWait waits from 1s to 5m, to allow for the background
@@ -332,41 +459,63 @@ func (mvb *mixedVersionBackup) waitForJobSuccess(
 	return fmt.Errorf("waiting for job to finish: %w", lastErr)
 }
 
-// computeFingerprint returns the fingerprint for a given table; if a
-// non-empty `timestamp` is passed, the fingerprints is calculated as
-// of that timestamp.
-func (mvb *mixedVersionBackup) computeFingerprint(
-	table, timestamp string, rng *rand.Rand, h *mixedversion.Helper,
-) (string, error) {
-	var aost, fprint string
-	if timestamp != "" {
-		aost = fmt.Sprintf(" AS OF SYSTEM TIME '%s'", timestamp)
+// computeFingerprints returns the fingerprint for a set of tables; if
+// a non-empty `timestamp` is passed, the fingerprints are calculated
+// as of that timestamp.
+func (mvb *mixedVersionBackup) computeFingerprints(
+	ctx context.Context,
+	l *logger.Logger,
+	rng *rand.Rand,
+	tables []string,
+	timestamp string,
+	h *mixedversion.Helper,
+) ([]string, error) {
+	node, db := h.RandomDB(rng, mvb.roachNodes)
+	fprints := make([]string, len(tables))
+	l.Printf("querying fingerprints through node %d", node)
+	eg, _ := errgroup.WithContext(ctx)
+	for i, table := range tables {
+		i, table := i, table // capture range variables
+		eg.Go(func() error {
+			var aost, fprint string
+			if timestamp != "" {
+				aost = fmt.Sprintf(" AS OF SYSTEM TIME '%s'", timestamp)
+			}
+
+			query := fmt.Sprintf("SELECT fingerprint FROM [SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE %s]%s", table, aost)
+			if err := db.QueryRow(query).Scan(&fprint); err != nil {
+				return err
+			}
+
+			fprints[i] = fprint
+			return nil
+		})
 	}
 
-	query := fmt.Sprintf("SELECT fingerprint FROM [SHOW EXPERIMENTAL_FINGERPRINTS FROM TABLE %s]%s", table, aost)
-	if err := h.QueryRow(rng, query).Scan(&fprint); err != nil {
-		return "", err
+	if err := eg.Wait(); err != nil {
+		return nil, err
 	}
 
-	return fprint, nil
+	return fprints, nil
 }
 
 // saveFingerprint stores the backup collection in the
-// `mixedVersionBackup` struct, along with the associated fingerprint.
-func (mvb *mixedVersionBackup) saveFingerprint(
+// `mixedVersionBackup` struct, along with the associated fingerprints.
+func (mvb *mixedVersionBackup) saveFingerprints(
+	ctx context.Context,
 	l *logger.Logger,
 	rng *rand.Rand,
 	collection *backupCollection,
 	timestamp string,
 	h *mixedversion.Helper,
 ) error {
-	fprint, err := mvb.computeFingerprint(mvb.table, timestamp, rng, h)
+	fprints, err := mvb.computeFingerprints(ctx, l, rng, collection.btype.TargetTables(), timestamp, h)
 	if err != nil {
 		return fmt.Errorf("error computing fingerprint for backup %s: %w", collection.uri, err)
 	}
 
-	collection.dataFingerprint = fprint
-	l.Printf("fingerprint(%s) = %s", collection.uri, collection.dataFingerprint)
+	collection.dataFingerprints = fprints
+	l.Printf("computed %d fingerprints for %s", len(fprints), collection.uri)
 	mvb.collections = append(mvb.collections, collection)
 	return nil
 }
@@ -404,6 +553,7 @@ func (mvb *mixedVersionBackup) runBackup(
 		destNode := h.RandomNode(rng, mvb.roachNodes)
 		createOptions := newBackupOptions(rng)
 		collection = backupCollection{
+			btype:   newBackupType(rng, mvb.db, mvb.tables),
 			uri:     fmt.Sprintf("nodelocal://%d/%s", destNode, name),
 			options: createOptions,
 		}
@@ -420,8 +570,12 @@ func (mvb *mixedVersionBackup) runBackup(
 	node, db := h.RandomDB(rng, nodes)
 
 	stmt := fmt.Sprintf(
-		"BACKUP TABLE %s INTO%s '%s' AS OF SYSTEM TIME '%s' WITH %s",
-		mvb.table, latest, collection.uri, backupTime, strings.Join(options, ", "),
+		"%s INTO%s '%s' AS OF SYSTEM TIME '%s' WITH %s",
+		collection.btype.BackupCommand(),
+		latest,
+		collection.uri,
+		backupTime,
+		strings.Join(options, ", "),
 	)
 	l.Printf("creating %s backup via node %d: %s", bType, node, stmt)
 	var jobID int
@@ -500,7 +654,7 @@ func (mvb *mixedVersionBackup) createBackupCollection(
 		return err
 	}
 
-	return mvb.saveFingerprint(l, rng, &collection, timestamp, h)
+	return mvb.saveFingerprints(ctx, l, rng, &collection, timestamp, h)
 }
 
 // sentinelFilePath returns the path to the file that prevents job
@@ -669,41 +823,52 @@ func (mvb *mixedVersionBackup) verifyBackups(
 	l.Printf("verifying %d collections created during this test", len(mvb.collections))
 	for _, collection := range mvb.collections {
 		l.Printf("verifying %s", collection.uri)
-		intoDB := fmt.Sprintf("restore_%s", invalidDBNameRE.ReplaceAllString(collection.uri, "_"))
+		uniqueName := fmt.Sprintf("restore_%s", invalidDBNameRE.ReplaceAllString(collection.uri, "_"))
 
-		// Restore the backup.
-		createDB := fmt.Sprintf("CREATE DATABASE %s", intoDB)
+		// Create a database with the unique name generated. This will be
+		// used by table and database backups.
+		createDB := fmt.Sprintf("CREATE DATABASE %s", uniqueName)
 		if err := h.Exec(rng, createDB); err != nil {
-			return fmt.Errorf("backup %s: error creating database %s: %w", collection.uri, intoDB, err)
+			return fmt.Errorf("backup %s: error creating database %s: %w", collection.uri, uniqueName, err)
 		}
+		restoreCmd, options := collection.btype.RestoreCommand(uniqueName)
+		restoreOptions := append([]string{}, options...)
 		// If the backup was created with an encryption passphrase, we
 		// need to include it when restoring as well.
-		var passphraseOption string
 		for _, option := range collection.options {
 			if ep, ok := option.(encryptionPassphrase); ok {
-				passphraseOption = fmt.Sprintf(", %s", ep.String())
+				restoreOptions = append(restoreOptions, ep.String())
 			}
 		}
+
+		var optionsStr string
+		if len(restoreOptions) > 0 {
+			optionsStr = fmt.Sprintf(" WITH %s", strings.Join(restoreOptions, ", "))
+		}
 		restoreDB := fmt.Sprintf(
-			"RESTORE TABLE %s FROM LATEST IN '%s' WITH into_db = '%s'%s",
-			mvb.table, collection.uri, intoDB, passphraseOption,
+			"%s FROM LATEST IN '%s'%s",
+			restoreCmd, collection.uri, optionsStr,
 		)
 		if err := h.Exec(rng, restoreDB); err != nil {
-			return fmt.Errorf("backup %s: error restoring %s: %w", collection.uri, mvb.table, err)
+			return fmt.Errorf("backup %s: error restoring: %w", collection.uri, err)
 		}
 
-		origTableName := strings.Split(mvb.table, ".")[1]
-		restoredTable := fmt.Sprintf("%s.%s", intoDB, origTableName)
-		restoredFingerprint, err := mvb.computeFingerprint(restoredTable, "" /* timestamp */, rng, h)
+		origTables := collection.btype.TargetTables()
+		restoredTables := tableNamesWithDB(uniqueName, origTables)
+		restoredFingerprints, err := mvb.computeFingerprints(
+			ctx, l, rng, restoredTables, "" /* timestamp */, h,
+		)
 		if err != nil {
-			return fmt.Errorf("backup %s: error computing fingerprint for %s: %w", collection.uri, restoredTable, err)
+			return fmt.Errorf("backup %s: error computing fingerprints: %w", collection.uri, err)
 		}
 
-		if restoredFingerprint != collection.dataFingerprint {
-			return fmt.Errorf(
-				"backup %s: mismatched fingerprints (expected=%s | actual=%s)",
-				collection.uri, collection.dataFingerprint, restoredFingerprint,
-			)
+		for i := 0; i < len(restoredFingerprints); i++ {
+			if collection.dataFingerprints[i] != restoredFingerprints[i] {
+				return fmt.Errorf(
+					"backup %s: mismatched fingerprints for table %s (expected=%s | actual=%s)",
+					collection.uri, origTables[i], collection.dataFingerprints[i], restoredFingerprints[i],
+				)
+			}
 		}
 
 		l.Printf("%s: OK", collection.uri)
@@ -739,7 +904,7 @@ func registerBackupMixedVersion(r registry.Registry) {
 				Option("tolerate-errors")
 
 			mvt := mixedversion.NewTest(ctx, t, t.L(), c, roachNodes)
-			mvb := newMixedVersionBackup(c, roachNodes, "bank.bank")
+			mvb := newMixedVersionBackup(c, roachNodes, "bank")
 			mvt.OnStartup("set short job interval", mvb.setShortJobIntervals)
 			mvt.OnStartup("load backup data", mvb.loadBackupData)
 			mvt.Workload("bank", workloadNode, nil /* initCmd */, bankRun)
