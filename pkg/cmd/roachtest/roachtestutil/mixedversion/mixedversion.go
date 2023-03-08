@@ -183,7 +183,7 @@ type (
 		// background. When a step is *not* run in the background, the
 		// test will wait for it to finish before moving on. When a
 		// background step fails, the entire test fails.
-		Background() bool
+		Background() shouldStop
 		// Run implements the actual functionality of the step.
 		Run(context.Context, *logger.Logger, cluster.Cluster, *Helper) error
 	}
@@ -215,10 +215,15 @@ type (
 		seed  int64
 		hooks *testHooks
 
+		bgChans []shouldStop
+
 		// test-only field, allowing us to avoid passing a test.Test
 		// implementation in the tests
 		_buildVersion version.Version
 	}
+
+	shouldStop chan struct{}
+	StopFunc   func()
 )
 
 // NewTest creates a Test struct that users can use to create and run
@@ -309,8 +314,12 @@ func (t *Test) AfterUpgradeFinalized(desc string, fn userFunc) {
 // cause the test to fail. These functions can run indefinitely but
 // should respect the context passed to them, which will be canceled
 // when the test terminates (successfully or not).
-func (t *Test) BackgroundFunc(desc string, fn userFunc) {
+func (t *Test) BackgroundFunc(desc string, fn userFunc) StopFunc {
 	t.hooks.AddBackground(versionUpgradeHook{name: desc, fn: fn})
+
+	ch := make(shouldStop)
+	t.bgChans = append(t.bgChans, ch)
+	return func() { close(ch) }
 }
 
 // BackgroundCommand is a convenience wrapper around `BackgroundFunc`
@@ -322,8 +331,8 @@ func (t *Test) BackgroundFunc(desc string, fn userFunc) {
 // command itself lived within the `mixed-version/*.log` files.
 func (t *Test) BackgroundCommand(
 	desc string, nodes option.NodeListOption, cmd *roachtestutil.Command,
-) {
-	t.BackgroundFunc(desc, t.runCommandFunc(nodes, cmd.String()))
+) StopFunc {
+	return t.BackgroundFunc(desc, t.runCommandFunc(nodes, cmd.String()))
 }
 
 // Workload is a convenience wrapper that allows callers to run
@@ -333,7 +342,7 @@ func (t *Test) BackgroundCommand(
 // command to actually run the command; it is run in the background.
 func (t *Test) Workload(
 	name string, node option.NodeListOption, initCmd, runCmd *roachtestutil.Command,
-) {
+) StopFunc {
 	seed := uint64(t.prng.Int63())
 	addSeed := func(cmd *roachtestutil.Command) {
 		if !cmd.HasFlag("seed") {
@@ -347,7 +356,7 @@ func (t *Test) Workload(
 	}
 
 	addSeed(runCmd)
-	t.BackgroundCommand(fmt.Sprintf("%s workload", name), node, runCmd)
+	return t.BackgroundCommand(fmt.Sprintf("%s workload", name), node, runCmd)
 }
 
 // Run runs the mixed-version test. It should be called once all
@@ -385,6 +394,7 @@ func (t *Test) plan() (*TestPlan, error) {
 		crdbNodes:      t.crdbNodes,
 		hooks:          t.hooks,
 		prng:           t.prng,
+		bgChans:        t.bgChans,
 	}
 
 	return planner.Plan(), nil
@@ -414,8 +424,8 @@ type startFromCheckpointStep struct {
 	crdbNodes option.NodeListOption
 }
 
-func (s startFromCheckpointStep) ID() int          { return s.id }
-func (s startFromCheckpointStep) Background() bool { return false }
+func (s startFromCheckpointStep) ID() int                { return s.id }
+func (s startFromCheckpointStep) Background() shouldStop { return nil }
 
 func (s startFromCheckpointStep) Description() string {
 	return fmt.Sprintf("starting cluster from fixtures for version %q", s.version)
@@ -438,8 +448,7 @@ func (s startFromCheckpointStep) Run(
 
 	startOpts := option.DefaultStartOptsNoBackups()
 	startOpts.RoachprodOpts.Sequential = false
-	clusterupgrade.StartWithBinary(ctx, l, c, s.crdbNodes, binaryPath, startOpts)
-	return nil
+	return clusterupgrade.StartWithBinary(ctx, l, c, s.crdbNodes, binaryPath, startOpts)
 }
 
 // uploadCurrentVersionStep uploads the current cockroach binary to
@@ -453,8 +462,8 @@ type uploadCurrentVersionStep struct {
 	dest      string
 }
 
-func (s uploadCurrentVersionStep) ID() int          { return s.id }
-func (s uploadCurrentVersionStep) Background() bool { return false }
+func (s uploadCurrentVersionStep) ID() int                { return s.id }
+func (s uploadCurrentVersionStep) Background() shouldStop { return nil }
 
 func (s uploadCurrentVersionStep) Description() string {
 	return fmt.Sprintf("upload current binary to all cockroach nodes (%v)", s.crdbNodes)
@@ -480,8 +489,8 @@ type waitForStableClusterVersionStep struct {
 	nodes option.NodeListOption
 }
 
-func (s waitForStableClusterVersionStep) ID() int          { return s.id }
-func (s waitForStableClusterVersionStep) Background() bool { return false }
+func (s waitForStableClusterVersionStep) ID() int                { return s.id }
+func (s waitForStableClusterVersionStep) Background() shouldStop { return nil }
 
 func (s waitForStableClusterVersionStep) Description() string {
 	return fmt.Sprintf(
@@ -504,8 +513,8 @@ type preserveDowngradeOptionStep struct {
 	prng      *rand.Rand
 }
 
-func (s preserveDowngradeOptionStep) ID() int          { return s.id }
-func (s preserveDowngradeOptionStep) Background() bool { return false }
+func (s preserveDowngradeOptionStep) ID() int                { return s.id }
+func (s preserveDowngradeOptionStep) Background() shouldStop { return nil }
 
 func (s preserveDowngradeOptionStep) Description() string {
 	return "preventing auto-upgrades by setting `preserve_downgrade_option`"
@@ -539,8 +548,8 @@ type restartWithNewBinaryStep struct {
 	node    int
 }
 
-func (s restartWithNewBinaryStep) ID() int          { return s.id }
-func (s restartWithNewBinaryStep) Background() bool { return false }
+func (s restartWithNewBinaryStep) ID() int                { return s.id }
+func (s restartWithNewBinaryStep) Background() shouldStop { return nil }
 
 func (s restartWithNewBinaryStep) Description() string {
 	return fmt.Sprintf("restart node %d with binary version %s", s.node, versionMsg(s.version))
@@ -574,8 +583,8 @@ type finalizeUpgradeStep struct {
 	prng      *rand.Rand
 }
 
-func (s finalizeUpgradeStep) ID() int          { return s.id }
-func (s finalizeUpgradeStep) Background() bool { return false }
+func (s finalizeUpgradeStep) ID() int                { return s.id }
+func (s finalizeUpgradeStep) Background() shouldStop { return nil }
 
 func (s finalizeUpgradeStep) Description() string {
 	return "finalize upgrade by resetting `preserve_downgrade_option`"
@@ -597,11 +606,11 @@ type runHookStep struct {
 	testContext Context
 	prng        *rand.Rand
 	hook        versionUpgradeHook
-	background  bool
+	stopChan    shouldStop
 }
 
-func (s runHookStep) ID() int          { return s.id }
-func (s runHookStep) Background() bool { return s.background }
+func (s runHookStep) ID() int                { return s.id }
+func (s runHookStep) Background() shouldStop { return s.stopChan }
 
 func (s runHookStep) Description() string {
 	return fmt.Sprintf("run %q", s.hook.name)
@@ -686,13 +695,24 @@ func (h hooks) Filter(testContext Context) hooks {
 // returned. Otherwise, a `concurrentRunStep` is returned, where every
 // hook is run concurrently.
 func (h hooks) AsSteps(
-	label string, idGen func() int, prng *rand.Rand, testContext Context, background bool,
+	label string, idGen func() int, prng *rand.Rand, testContext Context, stopChans []shouldStop,
 ) []testStep {
 	steps := make([]testStep, 0, len(h))
-	for _, hook := range h {
+	stopChanFor := func(j int) shouldStop {
+		if stopChans == nil {
+			return nil
+		}
+		return stopChans[j]
+	}
+
+	for j, hook := range h {
 		hookPrng := rngFromRNG(prng)
 		steps = append(steps, runHookStep{
-			id: idGen(), prng: hookPrng, hook: hook, background: background, testContext: testContext,
+			id:          idGen(),
+			prng:        hookPrng,
+			hook:        hook,
+			stopChan:    stopChanFor(j),
+			testContext: testContext,
 		})
 	}
 
@@ -720,21 +740,23 @@ func (th *testHooks) AddAfterUpgradeFinalized(hook versionUpgradeHook) {
 }
 
 func (th *testHooks) StartupSteps(idGen func() int, testContext Context) []testStep {
-	return th.startup.AsSteps(startupLabel, idGen, th.prng, testContext, false)
+	return th.startup.AsSteps(startupLabel, idGen, th.prng, testContext, nil)
 }
 
-func (th *testHooks) BackgroundSteps(idGen func() int, testContext Context) []testStep {
-	return th.background.AsSteps(backgroundLabel, idGen, th.prng, testContext, true)
+func (th *testHooks) BackgroundSteps(
+	idGen func() int, testContext Context, stopChans []shouldStop,
+) []testStep {
+	return th.background.AsSteps(backgroundLabel, idGen, th.prng, testContext, stopChans)
 }
 
 func (th *testHooks) MixedVersionSteps(testContext Context, idGen func() int) []testStep {
 	return th.mixedVersion.
 		Filter(testContext).
-		AsSteps(mixedVersionLabel, idGen, th.prng, testContext, false)
+		AsSteps(mixedVersionLabel, idGen, th.prng, testContext, nil)
 }
 
 func (th *testHooks) AfterUpgradeFinalizedSteps(idGen func() int, testContext Context) []testStep {
-	return th.afterUpgradeFinalized.AsSteps(afterTestLabel, idGen, th.prng, testContext, false)
+	return th.afterUpgradeFinalized.AsSteps(afterTestLabel, idGen, th.prng, testContext, nil)
 }
 
 func randomDelay(rng *rand.Rand) time.Duration {
