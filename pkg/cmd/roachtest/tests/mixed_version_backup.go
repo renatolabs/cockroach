@@ -588,6 +588,20 @@ func (mvb *mixedVersionBackup) enableJobAdoption(
 	return eg.Wait()
 }
 
+func (mvb *mixedVersionBackup) failTest(
+	ctx context.Context, l *logger.Logger, rng *rand.Rand, h *mixedversion.Helper,
+) error {
+	h.Background("similate failure", func(ctx context.Context, l *logger.Logger) error {
+		dur := 10 * time.Second
+		l.Printf("waiting %s", dur)
+
+		time.Sleep(dur)
+		return fmt.Errorf("simulating failure")
+	})
+
+	return nil
+}
+
 // planAndRunBackups is the function that can be passed to the
 // mixed-version test's `InMixedVersion` function. If the cluster is
 // in mixed-binary state, four backup collections are created: (see
@@ -736,6 +750,7 @@ func registerBackupMixedVersion(r registry.Registry) {
 			mvt.Workload("bank", workloadNode, nil /* initCmd */, bankRun)
 
 			mvt.InMixedVersion("plan and run backups", mvb.planAndRunBackups)
+			mvt.InMixedVersion("fail", mvb.failTest)
 			mvt.AfterUpgradeFinalized("verify backups", mvb.verifyBackups)
 
 			mvt.Run()
