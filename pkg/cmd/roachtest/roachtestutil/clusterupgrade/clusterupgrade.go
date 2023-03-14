@@ -147,7 +147,10 @@ func StartWithBinary(
 	binaryPath string,
 	startOpts option.StartOpts,
 ) {
-	settings := install.MakeClusterSettings(install.BinaryOption(binaryPath))
+	settings := install.MakeClusterSettings(
+		install.BinaryOption(binaryPath),
+		install.SecureOption(true),
+	)
 	c.Start(ctx, l, startOpts, settings, nodes)
 }
 
