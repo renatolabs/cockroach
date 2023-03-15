@@ -330,6 +330,11 @@ func (c *SyncedCluster) roachprodEnvRegex(node Node) string {
 // By wrapping every command with a hostname check as is done here, we
 // ensure that the cached cluster information is still correct.
 func (c *SyncedCluster) validateHostnameCmd(cmd string, node Node) string {
+	const hostValidationDisabled = true
+	if hostValidationDisabled {
+		return cmd
+	}
+
 	isValidHost := fmt.Sprintf("[[ `hostname` == '%s' ]]", vm.Name(c.Name, int(node)))
 	errMsg := fmt.Sprintf("expected host to be part of %s, but is `hostname`", c.Name)
 	elseBranch := "fi"
@@ -357,8 +362,11 @@ func (c *SyncedCluster) validateHost(ctx context.Context, l *logger.Logger, node
 	if c.IsLocal() {
 		return nil
 	}
-	cmd := c.validateHostnameCmd("", node)
-	return c.Run(ctx, l, l.Stdout, l.Stderr, Nodes{node}, "validate-ssh-host", cmd)
+	if cmd := c.validateHostnameCmd("", node); cmd != "" {
+		return c.Run(ctx, l, l.Stdout, l.Stderr, Nodes{node}, "validate-ssh-host", cmd)
+	}
+
+	return nil
 }
 
 // cmdDebugName is the suffix of the generated ssh debug file
