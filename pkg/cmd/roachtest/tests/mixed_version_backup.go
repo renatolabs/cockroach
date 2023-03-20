@@ -119,6 +119,7 @@ type (
 	collectionFingerprints struct {
 		mu   syncutil.Mutex
 		data map[string]tableFingerprints
+		outs map[string]string
 	}
 
 	// backupCollection wraps a backup collection (which may or may not
@@ -289,7 +290,10 @@ func (bc *backupCollection) uri() string {
 	return fmt.Sprintf("gs://cockroachdb-backup-testing/%s?AUTH=implicit", bc.name)
 }
 
-func (bc *backupCollection) checkRestoredFingerprints(restored *collectionFingerprints) error {
+func (bc *backupCollection) checkRestoredFingerprints(
+	l *logger.Logger, restored *collectionFingerprints, load func(string) (string, error),
+) error {
+	var hadError bool
 	for table, fingerprints := range bc.dataFingerprints.data {
 		restoredFingerprints, ok := restored.data[table]
 		if !ok {
@@ -304,11 +308,17 @@ func (bc *backupCollection) checkRestoredFingerprints(restored *collectionFinger
 			}
 
 			if origFingerprint != restoredFingerprint {
-				return fmt.Errorf(
+				out, err := load(table)
+				if err != nil {
+					return err
+				}
+				before := bc.dataFingerprints.outs[table]
+				l.Printf(
 					"backup %s: mismatched fingerprints for table %s, index %s.\n"+
-						"--- Expected: %s\n---Actual: %s",
-					bc.name, table, index, origFingerprint, restoredFingerprint,
+						"--- Expected: %s\n--- Actual:   %s\n--- Contents before:\n%s\n--- Contents after:\n%s",
+					bc.name, table, index, origFingerprint, restoredFingerprint, before, out,
 				)
+				hadError = true
 			}
 			fingerprintsCompared++
 		}
@@ -318,6 +328,9 @@ func (bc *backupCollection) checkRestoredFingerprints(restored *collectionFinger
 		}
 	}
 
+	if hadError {
+		return fmt.Errorf("fingerprint errors happened, see longs")
+	}
 	return nil
 }
 
@@ -344,6 +357,7 @@ func backupCollectionDesc(fullSpec, incSpec backupSpec) string {
 func newCollectionFingerprints() *collectionFingerprints {
 	return &collectionFingerprints{
 		data: make(map[string]tableFingerprints),
+		outs: make(map[string]string),
 	}
 }
 
@@ -352,6 +366,13 @@ func (cf *collectionFingerprints) addTableFingerprints(name string, tf tableFing
 	defer cf.mu.Unlock()
 
 	cf.data[name] = tf
+}
+
+func (cf *collectionFingerprints) addOut(name, out string) {
+	cf.mu.Lock()
+	defer cf.mu.Unlock()
+
+	cf.outs[name] = out
 }
 
 // mixedVersionBackup is the struct that contains all the necessary
@@ -611,6 +632,14 @@ func (mvb *mixedVersionBackup) computeFingerprints(
 					}
 				}
 				currentFingerprints[indexName] = actualFingerprint
+			}
+
+			outQuery := fmt.Sprintf("SELECT * FROM %s%s", table, aost)
+			cmd := fmt.Sprintf("%s sql --insecure -e '%s'", mixedversion.CurrentCockroachPath, outQuery)
+			if out, err := mvb.cluster.RunWithDetailsSingleNode(ctx, l, option.NodeListOption{node}, cmd); err != nil {
+				return fmt.Errorf("failed to run query %q: %w", outQuery, err)
+			} else {
+				allFingerprints.addOut(table, out.Stdout)
 			}
 
 			allFingerprints.addTableFingerprints(table, currentFingerprints)
@@ -1015,7 +1044,19 @@ func (mvb *mixedVersionBackup) verifyBackups(
 			return fmt.Errorf("backup %s: error computing fingerprints: %w", collection.name, err)
 		}
 
-		if err := collection.checkRestoredFingerprints(restoredFingerprints); err != nil {
+		loadDataForTable := func(table string) (string, error) {
+			outQuery := fmt.Sprintf("SELECT * FROM %s", table)
+			cmd := fmt.Sprintf("%s sql --insecure -e '%s'", mixedversion.CurrentCockroachPath, outQuery)
+			node := mvb.roachNodes[0]
+			out, err := mvb.cluster.RunWithDetailsSingleNode(ctx, l, option.NodeListOption{node}, cmd)
+			if err != nil {
+				return "", fmt.Errorf("failed to run query %q: %w", outQuery, err)
+			}
+
+			return out.Stdout, nil
+		}
+
+		if err := collection.checkRestoredFingerprints(l, restoredFingerprints, loadDataForTable); err != nil {
 			return err
 		}
 
