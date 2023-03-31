@@ -70,7 +70,7 @@ var (
 		InitialBackoff: 10 * time.Second,
 		MaxBackoff:     1 * time.Minute,
 		Multiplier:     1.5,
-		MaxRetries:     50,
+		MaxRetries:     80,
 	}
 
 	v231 = func() *version.Version {
@@ -108,6 +108,38 @@ var (
 		"users":        "SHOW USERS",
 		"zones":        "SHOW ZONE CONFIGURATIONS",
 	}
+
+	systemSettingValues = map[string][]string{
+		"bulkio.backup.file_size":                        {"8MiB", "32MiB", "512MiB", "750MiB"},
+		"bulkio.backup.read_timeout":                     {"2m0s", "10m0s"},
+		"bulkio.backup.read_with_priority_after":         {"20s", "5m0s"},
+		"bulkio.stream_ingestion.minimum_flush_interval": {"1s", "10s", "30s"},
+		"kv.bulk_io_write.max_rate":                      {"250MiB", "500MiB", "2TiB"},
+		"kv.bulk_sst.max_allowed_overage":                {"16MiB", "256MiB"},
+		"kv.bulk_sst.target_size":                        {"4MiB", "64MiB", "128MiB"},
+	}
+
+	systemSettingNames = func() []string {
+		var names []string
+		for name := range systemSettingValues {
+			names = append(names, name)
+		}
+
+		return names
+	}()
+
+	randomBankPossibleRows = []int{
+		100,    // creates keys with long revision history
+		1_000,  // small backup
+		10_000, // larger backups (a few GiB when using 128 KiB payloads)
+	}
+	randomBankPossiblePayloadBytes = []int{
+		0,         // workload default
+		9,         // 1 random byte (`initial-` + 1)
+		500,       // 5x default at the time of writing
+		16 << 10,  // 16 KiB
+		128 << 10, // 128 KiB
+	}
 )
 
 // sanitizeVersionForBackup takes the string representation of a
@@ -115,6 +147,21 @@ var (
 // backup destination.
 func sanitizeVersionForBackup(v string) string {
 	return invalidVersionRE.ReplaceAllString(clusterupgrade.VersionMsg(v), "")
+}
+
+func isIntermittentBackupError(err error) bool {
+	intermittentSubstrings := []string{
+		"response code 503",
+		"Error 503",
+	}
+
+	for _, s := range intermittentSubstrings {
+		if strings.Contains(err.Error(), s) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // hasInternalSystemJobs returns true if the cluster is expected to
@@ -294,6 +341,12 @@ type (
 		options []backupOption
 		nonce   string
 
+		// skipRestore indicates if we should skip restoring this
+		// collection when verifying backups during or at the end of this
+		// test. This typically means that there was an intermittent error
+		// while the backup was created (e.g., GCS unavailability).
+		skipRestore bool
+
 		// tables is the list of tables that we are going to verify once
 		// this backup is restored. There should be a 1:1 mapping between
 		// the table names in `tables` and the `tableContents` implementations
@@ -359,12 +412,25 @@ func (rh revisionHistory) String() string {
 	return "revision_history"
 }
 
-func newEncryptionPassphrase(rng *rand.Rand) encryptionPassphrase {
-	minLen := 32
-	maxLen := 64
-	pwdLen := rng.Intn(maxLen-minLen) + minLen
+func randIntBetween(rng *rand.Rand, min, max int) int {
+	if min == max {
+		return min
+	}
 
-	return encryptionPassphrase{randutil.RandString(rng, pwdLen, randutil.PrintableKeyAlphabet)}
+	return rng.Intn(max-min) + min
+}
+
+func randString(rng *rand.Rand, strLen int) string {
+	return randutil.RandString(rng, strLen, randutil.PrintableKeyAlphabet)
+}
+
+func randWaitDuration(rng *rand.Rand) time.Duration {
+	durations := []int{1, 10, 60, 5 * 60}
+	return time.Duration(durations[rng.Intn(len(durations))]) * time.Second
+}
+
+func newEncryptionPassphrase(rng *rand.Rand) encryptionPassphrase {
+	return encryptionPassphrase{randString(rng, randIntBetween(rng, 32, 64))}
 }
 
 func (ep encryptionPassphrase) String() string {
@@ -388,6 +454,20 @@ func newBackupOptions(rng *rand.Rand) []backupOption {
 	}
 
 	return options
+}
+
+func newCommentTarget(rng *rand.Rand, dbs []string, tables [][]string) (string, string) {
+	const dbCommentProbability = 0.4
+
+	targetDBIdx := rng.Intn(len(dbs))
+	targetDB := dbs[targetDBIdx]
+	if rng.Float64() < dbCommentProbability {
+		return "database", targetDB
+	}
+
+	dbTables := tables[targetDBIdx]
+	targetTable := dbTables[rng.Intn(len(dbTables))]
+	return "table", fmt.Sprintf("%s.%s", targetDB, targetTable)
 }
 
 func newTableBackup(rng *rand.Rand, dbs []string, tables [][]string) *tableBackup {
@@ -681,6 +761,14 @@ func (sc *systemTableContents) scheduledJobsHandler(
 		Values()
 }
 
+func (sc *systemTableContents) commentsHandler(
+	values []interface{}, columns []string,
+) ([]interface{}, error) {
+	return newSystemTableRow(sc.table, values, columns).
+		WithSentinel("object_id").
+		Values()
+}
+
 // handleSpecialCases exists because there are still cases where we
 // can't assume that the contents of a system table are the same after
 // a RESTORE. Columns that cannot be expected to be the same are
@@ -693,6 +781,8 @@ func (sc *systemTableContents) handleSpecialCases(
 		return sc.settingsHandler(row, columns)
 	case "system.scheduled_jobs":
 		return sc.scheduledJobsHandler(row, columns)
+	case "system.comments":
+		return sc.commentsHandler(row, columns)
 	default:
 		return row, nil
 	}
@@ -845,7 +935,7 @@ func newBackupCollection(name string, btype backupType, options []backupOption) 
 		name:    name,
 		tables:  btype.TargetTables(),
 		options: options,
-		nonce:   randutil.RandString(nonceRng, nonceLen, randutil.PrintableKeyAlphabet),
+		nonce:   randString(nonceRng, nonceLen),
 	}
 }
 
@@ -885,8 +975,9 @@ type mixedVersionBackup struct {
 	// backup collections that are created along the test
 	collections []*backupCollection
 	// databases where user data is being inserted
-	dbs    []string
-	tables [][]string
+	dbs          []string
+	tables       [][]string
+	tablesLoaded *atomic.Bool
 	// counter that is incremented atomically to provide unique
 	// identifiers to backups created during the test
 	currentBackupID int64
@@ -896,17 +987,22 @@ type mixedVersionBackup struct {
 	// database backups are restored.
 	currentRestoreID int64
 
-	// stopWorkloads can be called to stop the any workloads started in
-	// this test. Useful when restoring cluster backups, as we don't
-	// want a stream of errors in the workload due to the nodes
-	// stopping.
-	stopWorkloads mixedversion.StopFunc
+	// stopBackground can be called to stop any background functions
+	// (including workloads) started in this test. Useful when restoring
+	// cluster backups, as we don't want a stream of errors in the
+	// these functions due to the nodes stopping.
+	stopBackground mixedversion.StopFunc
 }
 
 func newMixedVersionBackup(
 	c cluster.Cluster, roachNodes option.NodeListOption, dbs ...string,
 ) *mixedVersionBackup {
-	return &mixedVersionBackup{cluster: c, dbs: dbs, roachNodes: roachNodes}
+	var tablesLoaded atomic.Bool
+	tablesLoaded.Store(false)
+
+	return &mixedVersionBackup{
+		cluster: c, dbs: dbs, roachNodes: roachNodes, tablesLoaded: &tablesLoaded,
+	}
 }
 
 // newBackupType chooses a random backup type (table, database,
@@ -930,6 +1026,63 @@ func (*mixedVersionBackup) setShortJobIntervals(
 	return setShortJobIntervalsCommon(func(query string, args ...interface{}) error {
 		return h.Exec(rng, query, args...)
 	})
+}
+
+func (mvb *mixedVersionBackup) randomSystemInserter(
+	ctx context.Context, l *logger.Logger, rng *rand.Rand, h *mixedversion.Helper,
+) error {
+	for !mvb.tablesLoaded.Load() {
+		l.Printf("waiting for user tables to be loaded...")
+		time.Sleep(10 * time.Second)
+	}
+	l.Printf("user tables loaded, starting random inserts")
+
+	type systemOperation func() error
+	addComment := func() error {
+		const nullProbability = 0.2
+		object, name := newCommentTarget(rng, mvb.dbs, mvb.tables)
+
+		removeComment := rng.Float64() < nullProbability
+		var prefix, commentContents string
+		if removeComment {
+			prefix = fmt.Sprintf("removing comment from %s", object)
+			commentContents = "NULL"
+		} else {
+			prefix = fmt.Sprintf("adding comment to %s", object)
+			commentLen := randIntBetween(rng, 64, 1024)
+			commentContents = fmt.Sprintf("'%s'", randString(rng, commentLen))
+		}
+
+		l.Printf("%s: %s", prefix, name)
+		return h.Exec(rng, fmt.Sprintf("COMMENT ON %s %s IS %s", strings.ToUpper(object), name, commentContents))
+	}
+
+	addExternalConnection := func() error {
+		node := h.RandomNode(rng, mvb.roachNodes)
+		l.Printf("adding external connection to node %d", node)
+		nodeLocal := fmt.Sprintf("nodelocal://%d/%s", node, randString(rng, 16))
+		name := randString(rng, 8)
+		return h.Exec(rng, fmt.Sprintf("CREATE EXTERNAL CONNECTION %q AS '%s'", name, nodeLocal))
+	}
+
+	possibleOps := []systemOperation{
+		addComment, addExternalConnection,
+	}
+	for {
+		nextDur := randWaitDuration(rng)
+		l.Printf("will attempt a random insert in %s", nextDur)
+
+		select {
+		case <-time.After(nextDur):
+			op := possibleOps[rng.Intn(len(possibleOps))]
+			if err := op(); err != nil {
+				l.Printf("error running operation: %v", err)
+			}
+		case <-ctx.Done():
+			l.Printf("context is canceled, finishing")
+			return nil
+		}
+	}
 }
 
 // loadTables returns a list of tables that are part of the database
@@ -975,48 +1128,34 @@ func (mvb *mixedVersionBackup) loadTables(
 	}
 
 	mvb.tables = allTables
+	mvb.tablesLoaded.Store(true)
 	return nil
 }
 
-// loadBackupData starts a CSV server in the background and runs
-// imports a bank fixture. Blocks until the importing is finished, at
-// which point the CSV server is terminated.
-func (mvb *mixedVersionBackup) loadBackupData(
+func (mvb *mixedVersionBackup) setClusterSettings(
 	ctx context.Context, l *logger.Logger, rng *rand.Rand, h *mixedversion.Helper,
-) (err error) {
-	var rows int
-	if mvb.cluster.IsLocal() {
-		rows = 100
-		l.Printf("importing only %d rows (as this is a local run)", rows)
-	} else {
-		rows = rows3GiB
-		l.Printf("importing %d rows", rows)
-	}
+) error {
+	const numCustomSettings = 3
+	const defaultSettingsProbability = 0.2
 
-	csvPort := 8081
-	importNode := h.RandomNode(rng, mvb.roachNodes)
-	l.Printf("decided to run import on node %d", importNode)
-
-	currentRoach := mixedversion.CurrentCockroachPath
-	stopCSVServer := h.Background("csv server", func(bgCtx context.Context, bgLogger *logger.Logger) error {
-		cmd := importBankCSVServerCommand(currentRoach, csvPort)
-		bgLogger.Printf("running CSV server in the background: %q", cmd)
-		if err := mvb.cluster.RunE(bgCtx, mvb.roachNodes, cmd); err != nil {
-			return fmt.Errorf("error while running csv server: %w", err)
-		}
-
+	if rng.Float64() < defaultSettingsProbability {
+		l.Printf("not setting any custom cluster settings (using defaults)")
 		return nil
-	})
-	defer stopCSVServer()
-	if err := waitForPort(ctx, l, mvb.roachNodes, csvPort, mvb.cluster); err != nil {
-		return err
 	}
 
-	return mvb.cluster.RunE(
-		ctx,
-		mvb.cluster.Node(importNode),
-		importBankCommand(currentRoach, rows, 0 /* ranges */, csvPort, importNode),
-	)
+	for j := 0; j < numCustomSettings; j++ {
+		setting := systemSettingNames[rng.Intn(len(systemSettingNames))]
+		possibleValues := systemSettingValues[setting]
+		value := possibleValues[rng.Intn(len(possibleValues))]
+
+		l.Printf("setting cluster setting %q to %q", setting, value)
+		stmt := fmt.Sprintf("SET CLUSTER SETTING %s = '%s'", setting, value)
+		if err := h.Exec(rng, stmt); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // takePreviousVersionBackup creates a backup collection (full +
@@ -1027,7 +1166,7 @@ func (mvb *mixedVersionBackup) loadBackupData(
 func (mvb *mixedVersionBackup) takePreviousVersionBackup(
 	ctx context.Context, l *logger.Logger, rng *rand.Rand, h *mixedversion.Helper,
 ) error {
-	// the wait here is to allow the workloads (which are initializing
+	// The wait here is to allow the workloads (which are initializing
 	// concurrently with this step) to store some data in the cluster by
 	// the time the backup is taken.
 	wait := 3 * time.Minute
@@ -1060,10 +1199,9 @@ func (mvb *mixedVersionBackup) takePreviousVersionBackup(
 }
 
 // randomWait waits from 1s to 5m, to allow for the background
-// workload to update the underlying table we are backing up.
+// workloads to update the databases we are backing up.
 func (mvb *mixedVersionBackup) randomWait(l *logger.Logger, rng *rand.Rand) {
-	durations := []int{1, 10, 60, 5 * 60}
-	dur := time.Duration(durations[rng.Intn(len(durations))]) * time.Second
+	dur := randWaitDuration(rng)
 	l.Printf("waiting for %s", dur)
 	time.Sleep(dur)
 }
@@ -1220,15 +1358,21 @@ func (mvb *mixedVersionBackup) saveContents(
 	timestamp string,
 	h *mixedversion.Helper,
 ) error {
-	contents, err := mvb.computeTableContents(
-		ctx, l, rng, collection.tables, nil /* previousContents */, timestamp, h,
-	)
-	if err != nil {
-		return fmt.Errorf("error computing contents for backup %s: %w", collection.name, err)
+	if timestamp == "" {
+		l.Printf("backup %s: will not load table contents", collection.name)
+	} else {
+		l.Printf("backup %s: loading table contents at timestamp '%s'", collection.name, timestamp)
+		contents, err := mvb.computeTableContents(
+			ctx, l, rng, collection.tables, nil /* previousContents */, timestamp, h,
+		)
+		if err != nil {
+			return fmt.Errorf("error computing contents for backup %s: %w", collection.name, err)
+		}
+
+		collection.contents = contents
+		l.Printf("computed contents for %d tables as part of %s", len(collection.contents), collection.name)
 	}
 
-	collection.contents = contents
-	l.Printf("computed contents for %d tables as part of %s", len(collection.contents), collection.name)
 	mvb.collections = append(mvb.collections, collection)
 	return nil
 }
@@ -1260,6 +1404,7 @@ func (mvb *mixedVersionBackup) runBackup(
 
 	var latest string
 	var collection backupCollection
+	_, isFullBackup := bType.(fullBackup)
 	switch b := bType.(type) {
 	case fullBackup:
 		btype := mvb.newBackupType(rng)
@@ -1296,7 +1441,17 @@ func (mvb *mixedVersionBackup) runBackup(
 
 	l.Printf("waiting for job %d (%s)", jobID, collection.name)
 	if err := mvb.waitForJobSuccess(ctx, l, rng, h, jobID); err != nil {
-		return backupCollection{}, "", err
+		if isIntermittentBackupError(err) {
+			var willSkip string
+			if isFullBackup {
+				collection.skipRestore = true
+				willSkip = " (will skip verification)"
+			}
+			l.Printf("backup %s: failed with intermittent error%s: %v", collection.name, willSkip, err)
+			backupTime = ""
+		} else {
+			return backupCollection{}, "", err
+		}
 	}
 
 	return collection, backupTime, nil
@@ -1351,19 +1506,21 @@ func (mvb *mixedVersionBackup) createBackupCollection(
 	if err := mvb.runJobOnOneOf(ctx, l, fullBackupSpec.Execute.Nodes, h, func() error {
 		var err error
 		label := backupCollectionDesc(fullBackupSpec, incBackupSpec)
-		collection, _, err = mvb.runBackup(ctx, l, fullBackup{label}, rng, fullBackupSpec.Plan.Nodes, h)
+		collection, timestamp, err = mvb.runBackup(ctx, l, fullBackup{label}, rng, fullBackupSpec.Plan.Nodes, h)
 		return err
 	}); err != nil {
 		return err
 	}
 
 	// Create incremental backup.
-	if err := mvb.runJobOnOneOf(ctx, l, incBackupSpec.Execute.Nodes, h, func() error {
-		var err error
-		collection, timestamp, err = mvb.runBackup(ctx, l, incrementalBackup{collection}, rng, incBackupSpec.Plan.Nodes, h)
-		return err
-	}); err != nil {
-		return err
+	if !collection.skipRestore {
+		if err := mvb.runJobOnOneOf(ctx, l, incBackupSpec.Execute.Nodes, h, func() error {
+			var err error
+			collection, timestamp, err = mvb.runBackup(ctx, l, incrementalBackup{collection}, rng, incBackupSpec.Plan.Nodes, h)
+			return err
+		}); err != nil {
+			return err
+		}
 	}
 
 	return mvb.saveContents(ctx, l, rng, &collection, timestamp, h)
@@ -1471,13 +1628,6 @@ func (mvb *mixedVersionBackup) planAndRunBackups(
 	tc := h.Context() // test context
 	l.Printf("current context: %#v", tc)
 
-	if len(mvb.tables) == 0 {
-		l.Printf("planning backups for the first time; loading all user tables")
-		if err := mvb.loadTables(ctx, l, rng, h); err != nil {
-			return fmt.Errorf("error loading user tables: %w", err)
-		}
-	}
-
 	onPrevious := labeledNodes{
 		Nodes: tc.FromVersionNodes, Version: sanitizeVersionForBackup(tc.FromVersion),
 	}
@@ -1540,6 +1690,11 @@ func (mvb *mixedVersionBackup) verifyBackupCollection(
 	h *mixedversion.Helper,
 	collection *backupCollection,
 ) error {
+	if collection.skipRestore {
+		l.Printf("skipping verification of %s", collection.name)
+		return nil
+	}
+
 	l.Printf("verifying %s", collection.name)
 
 	// Defaults for the database where the backup will be restored,
@@ -1660,8 +1815,8 @@ func (mvb *mixedVersionBackup) verifySomeBackups(
 func (mvb *mixedVersionBackup) verifyAllBackups(
 	ctx context.Context, l *logger.Logger, rng *rand.Rand, h *mixedversion.Helper,
 ) error {
-	l.Printf("stopping background workloads")
-	mvb.stopWorkloads()
+	l.Printf("stopping background functions and workloads")
+	mvb.stopBackground()
 
 	l.Printf("verifying %d collections created during this test", len(mvb.collections))
 	for _, collection := range mvb.collections {
@@ -1693,6 +1848,8 @@ func registerBackupMixedVersion(r registry.Registry) {
 
 			roachNodes := c.Range(1, c.Spec().NodeCount-1)
 			workloadNode := c.Node(c.Spec().NodeCount)
+			mvt := mixedversion.NewTest(ctx, t, t.L(), c, roachNodes)
+			testRNG := mvt.RNG()
 
 			uploadVersion(ctx, t, c, workloadNode, clusterupgrade.MainVersion)
 			// numWarehouses is picked as a number that provides enough work
@@ -1706,27 +1863,36 @@ func registerBackupMixedVersion(r registry.Registry) {
 				Arg("{pgurl%s}", roachNodes).
 				Flag("warehouses", numWarehouses).
 				Option("tolerate-errors")
+
+			bankRows := randomBankPossibleRows[testRNG.Intn(len(randomBankPossibleRows))]
+			bankPayload := randomBankPossiblePayloadBytes[testRNG.Intn(len(randomBankPossiblePayloadBytes))]
+			bankInit := roachtestutil.NewCommand("./cockroach workload init bank").
+				Flag("rows", bankRows).
+				MaybeFlag(bankPayload != 0, "payload-bytes", bankPayload).
+				Flag("ranges", 0).
+				Arg("{pgurl%s}", roachNodes)
 			bankRun := roachtestutil.NewCommand("./cockroach workload run bank").
 				Arg("{pgurl%s}", roachNodes).
 				Option("tolerate-errors")
 
-			var stopBank, stopTPCC mixedversion.StopFunc
-			mvt := mixedversion.NewTest(ctx, t, t.L(), c, roachNodes)
-			mvb := newMixedVersionBackup(c, roachNodes, "bank", "tpcc")
-			mvt.OnStartup("set short job interval", mvb.setShortJobIntervals)
-			mvt.OnStartup("load backup data", mvb.loadBackupData)
-			mvt.OnStartup("take backup in previous version", mvb.takePreviousVersionBackup)
+			backupTest := newMixedVersionBackup(c, roachNodes, "bank", "tpcc")
 
-			stopBank = mvt.Workload("bank", workloadNode, nil /* initCmd */, bankRun)
-			stopTPCC = mvt.Workload("tpcc", workloadNode, tpccInit, tpccRun)
+			mvt.OnStartup("set short job interval", backupTest.setShortJobIntervals)
+			mvt.OnStartup("take backup in previous version", backupTest.takePreviousVersionBackup)
+			mvt.OnStartup("maybe set custom cluster settings", backupTest.setClusterSettings)
 
-			mvt.InMixedVersion("plan and run backups", mvb.planAndRunBackups)
-			mvt.InMixedVersion("verify some backups", mvb.verifySomeBackups)
-			mvt.AfterUpgradeFinalized("verify all backups", mvb.verifyAllBackups)
+			stopRandomBank := mvt.Workload("bank", workloadNode, bankInit, bankRun)
+			stopTPCC := mvt.Workload("tpcc", workloadNode, tpccInit, tpccRun)
+			stopInserter := mvt.BackgroundFunc("random system inserter", backupTest.randomSystemInserter)
 
-			mvb.stopWorkloads = func() {
-				stopBank()
+			mvt.InMixedVersion("plan and run backups", backupTest.planAndRunBackups)
+			mvt.InMixedVersion("verify some backups", backupTest.verifySomeBackups)
+			mvt.AfterUpgradeFinalized("verify all backups", backupTest.verifyAllBackups)
+
+			backupTest.stopBackground = func() {
+				stopRandomBank()
 				stopTPCC()
+				stopInserter()
 			}
 			mvt.Run()
 		},

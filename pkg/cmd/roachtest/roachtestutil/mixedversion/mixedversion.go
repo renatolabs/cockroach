@@ -275,6 +275,10 @@ func NewTest(
 	}
 }
 
+func (t *Test) RNG() *rand.Rand {
+	return t.prng
+}
+
 // InMixedVersion adds a new mixed-version hook to the test. The
 // functionality in the function passed as argument to this function
 // will be tested in arbitrary mixed-version states. If multiple
