@@ -86,6 +86,14 @@ var (
 		"ui", "comments", "scheduled_jobs", "database_role_settings", "tenant_settings",
 		"privileges", "external_connections",
 	}
+
+	detailedSystemOutput = map[string]string{
+		"users":        "SHOW USERS",
+		"zones":        "SHOW ZONE CONFIGURATIONS",
+		"settings":     "SHOW CLUSTER SETTINGS",
+		"role_members": "SHOW ROLES",
+		"privileges":   "SHOW GRANTS",
+	}
 )
 
 // sanitizeVersionForBackup takes the string representation of a
@@ -235,13 +243,15 @@ type (
 	// system table at the time of the backup should continue to exist
 	// when the backup is restored.
 	systemTableContents struct {
-		ctx     context.Context
-		logger  *logger.Logger
-		db      *gosql.DB
-		name    string
-		table   string
-		columns []string
-		rows    map[string]struct{}
+		ctx         context.Context
+		logger      *logger.Logger
+		cluster     cluster.Cluster
+		db          *gosql.DB
+		name        string
+		table       string
+		columns     []string
+		rows        map[string]struct{}
+		showResults string
 	}
 
 	// backupCollection wraps a backup collection (which may or may not
@@ -481,7 +491,7 @@ func (fc *fingerprintContents) ValidateRestore(contents tableContents) error {
 }
 
 func newSystemTableContents(
-	ctx context.Context, l *logger.Logger, db *gosql.DB, name, timestamp string,
+	ctx context.Context, l *logger.Logger, c cluster.Cluster, db *gosql.DB, name, timestamp string,
 ) (*systemTableContents, error) {
 	// Dynamically load column names for the corresponding system
 	// table. We use an AOST clause as this may be happening while
@@ -510,7 +520,9 @@ func newSystemTableContents(
 		return nil, fmt.Errorf("error iterating over columns of %s: %w", name, err)
 	}
 
-	return &systemTableContents{ctx: ctx, logger: l, db: db, table: name, columns: columnNames}, nil
+	return &systemTableContents{
+		ctx: ctx, logger: l, db: db, table: name, columns: columnNames, cluster: c,
+	}, nil
 }
 
 func (sc *systemTableContents) Format() string {
@@ -549,6 +561,28 @@ func (sc *systemTableContents) handleSpecialCases(
 	// are only interested in verifying that the `version` setting
 	// exists, not that it matches any specific value.
 	return []interface{}{settingsTestVersion}, nil
+}
+
+func (sc *systemTableContents) loadShowResults(timestamp string) error {
+	systemName := strings.TrimPrefix(sc.table, "system.")
+	showStmt, exists := detailedSystemOutput[systemName]
+	if !exists {
+		return nil
+	}
+
+	query := fmt.Sprintf("SELECT * FROM [%s]%s", showStmt, aostFor(timestamp))
+	cmd := roachtestutil.NewCommand("%s sql", mixedversion.CurrentCockroachPath).
+		Option("insecure").
+		Flag("e", fmt.Sprintf("%q", query))
+
+	node := sc.cluster.Nodes(1)
+	out, err := sc.cluster.RunWithDetailsSingleNode(sc.ctx, sc.logger, node, cmd.String())
+	if err != nil {
+		return fmt.Errorf("error running command (%s): %w", cmd.String(), err)
+	}
+
+	sc.showResults = out.Stdout
+	return nil
 }
 
 // Load loads the contents of the underlying system table in memory.
@@ -618,6 +652,10 @@ func (sc *systemTableContents) Load(timestamp string, previous tableContents) er
 	}
 
 	sc.rows = rowSet
+	if err := sc.loadShowResults(timestamp); err != nil {
+		return err
+	}
+
 	sc.logger.Printf("loaded %d rows from %s", len(sc.rows), sc.table)
 	return nil
 }
@@ -627,26 +665,29 @@ func (sc *systemTableContents) Load(timestamp string, previous tableContents) er
 // is restored.
 func (sc *systemTableContents) ValidateRestore(contents tableContents) error {
 	restoredContents := contents.(*systemTableContents)
-	// Return an error early if there are *less* rows in the restored
-	// system table than there used to be at the time of the backup.
-	if len(sc.rows) > len(restoredContents.rows) {
-		return fmt.Errorf(
-			"restored system table %s has %d rows, original had %d",
-			sc.table, len(restoredContents.rows), len(sc.rows),
-		)
-	}
 
 	for originalRow := range sc.rows {
 		_, exists := restoredContents.rows[originalRow]
 		if !exists {
+			systemName := strings.TrimPrefix(sc.table, "system.")
+			showStmt := detailedSystemOutput[systemName]
+
+			showStr := func(c *systemTableContents, label string) string {
+				if c.showResults == "" {
+					return ""
+				}
+
+				return fmt.Sprintf("\n--- %q %s:\n%s", showStmt, label, c.showResults)
+			}
 			// Log the missing row and restored table contents here and
 			// avoid including it in the error itself as the error message
 			// from a test is displayed multiple times in a roachtest
 			// failure, and having a long, multi-line error message just
 			// adds noise to the logs.
 			sc.logger.Printf(
-				"--- Missing row in table %s:\n%s\n--- Original rows:\n%s\n---Restored contents:\n%s",
+				"--- Missing row in table %s:\n%s\n--- Original rows:\n%s\n--- Restored contents:\n%s%s%s",
 				sc.table, originalRow, sc.Format(), restoredContents.Format(),
+				showStr(sc, "when backup was taken"), showStr(restoredContents, "after restore"),
 			)
 
 			return fmt.Errorf("restored system table %s is missing a row: %s", sc.table, originalRow)
@@ -944,7 +985,7 @@ func (mvb *mixedVersionBackup) computeTableContents(
 			var contents tableContents
 			var err error
 			if strings.HasPrefix(table, "system.") {
-				contents, err = newSystemTableContents(ctx, l, db, table, timestamp)
+				contents, err = newSystemTableContents(ctx, l, mvb.cluster, db, table, timestamp)
 				if err != nil {
 					return err
 				}
