@@ -2301,15 +2301,9 @@ func (cfc *changefeedCreator) Args(args ...interface{}) *changefeedCreator {
 	return cfc
 }
 
-// Create builds the SQL statement that creates the changefeed job,
-// and executes it. Returns the job ID corresponding to the
-// changefeed, and any errors that occurred in the process
-func (cfc *changefeedCreator) Create() (int, error) {
-	// kv.rangefeed.enabled is required for changefeeds to run
-	if _, err := cfc.db.Exec("SET CLUSTER SETTING kv.rangefeed.enabled = true"); err != nil {
-		return -1, err
-	}
-
+// SQL returns the SQL statement to be used to create the changefeed,
+// along with any arguments to be passed when executing the statement.
+func (cfc *changefeedCreator) SQL() (string, []interface{}) {
 	stmt := fmt.Sprintf("CREATE CHANGEFEED FOR %s INTO $1", cfc.targets)
 
 	var options []string
@@ -2324,8 +2318,21 @@ func (cfc *changefeedCreator) Create() (int, error) {
 		stmt += fmt.Sprintf(" WITH %s", strings.Join(options, ", "))
 	}
 
-	var jobID int
 	args := append([]interface{}{cfc.sinkURL}, cfc.extraArgs...)
+	return stmt, args
+}
+
+// Create builds the SQL statement that creates the changefeed job,
+// and executes it. Returns the job ID corresponding to the
+// changefeed, and any errors that occurred in the process
+func (cfc *changefeedCreator) Create() (int, error) {
+	// kv.rangefeed.enabled is required for changefeeds to run
+	if _, err := cfc.db.Exec("SET CLUSTER SETTING kv.rangefeed.enabled = true"); err != nil {
+		return -1, err
+	}
+
+	var jobID int
+	stmt, args := cfc.SQL()
 	if err := cfc.db.QueryRow(stmt, args...).Scan(&jobID); err != nil {
 		return -1, err
 	}

@@ -92,6 +92,12 @@ var (
 		return v
 	}()
 
+	// Use a different seed for generating the nonces used in this test
+	// to allow for multiple concurrent runs of this test using the same
+	// COCKROACH_RANDOM_SEED, making it easier to reproduce failures
+	// that are more likely to occur with certain test plans.
+	nonceRng = rand.New(rand.NewSource(timeutil.Now().UnixNano()))
+
 	// systemTablesInFullClusterBackup includes all system tables that
 	// are included as part of a full cluster backup. It should include
 	// every table that opts-in to cluster backup (see `system_schema.go`).
@@ -430,6 +436,14 @@ func randWaitDuration(rng *rand.Rand) time.Duration {
 	return time.Duration(durations[rng.Intn(len(durations))]) * time.Second
 }
 
+func newNonce() string {
+	return randString(nonceRng, nonceLen)
+}
+
+func mixedVersionBackupURI(name string) string {
+	return fmt.Sprintf("gs://cockroachdb-backup-testing/mixed-version/%s?AUTH=implicit", name)
+}
+
 func newEncryptionPassphrase(rng *rand.Rand) encryptionPassphrase {
 	return encryptionPassphrase{randString(rng, randIntBetween(rng, 32, 64))}
 }
@@ -475,7 +489,7 @@ func newCommentTarget(rng *rand.Rand, dbs []string, tables [][]string) (string, 
 	return "table", fmt.Sprintf("%s.%s", targetDB, targetTable)
 }
 
-func newTableBackup(rng *rand.Rand, dbs []string, tables [][]string) *tableBackup {
+func randomTable(rng *rand.Rand, dbs []string, tables [][]string) (string, string) {
 	var targetDBIdx int
 	var targetDB string
 	// Avoid creating table backups for the tpcc database, as they often
@@ -489,7 +503,13 @@ func newTableBackup(rng *rand.Rand, dbs []string, tables [][]string) *tableBacku
 
 	dbTables := tables[targetDBIdx]
 	targetTable := dbTables[rng.Intn(len(dbTables))]
-	return &tableBackup{dbs[targetDBIdx], targetTable}
+
+	return targetDB, targetTable
+}
+
+func newTableBackup(rng *rand.Rand, dbs []string, tables [][]string) *tableBackup {
+	targetDB, targetTable := randomTable(rng, dbs, tables)
+	return &tableBackup{targetDB, targetTable}
 }
 
 func (tb *tableBackup) Desc() string {
@@ -930,17 +950,12 @@ func (sc *systemTableContents) ValidateRestore(
 }
 
 func newBackupCollection(name string, btype backupType, options []backupOption) backupCollection {
-	// Use a different seed for generating the collection's nonce to
-	// allow for multiple concurrent runs of this test using the same
-	// COCKROACH_RANDOM_SEED, making it easier to reproduce failures
-	// that are more likely to occur with certain test plans.
-	nonceRng := rand.New(rand.NewSource(timeutil.Now().UnixNano()))
 	return backupCollection{
 		btype:   btype,
 		name:    name,
 		tables:  btype.TargetTables(),
 		options: options,
-		nonce:   randString(nonceRng, nonceLen),
+		nonce:   newNonce(),
 	}
 }
 
@@ -949,7 +964,7 @@ func (bc *backupCollection) uri() string {
 	// global namespace represented by the cockroachdb-backup-testing
 	// bucket. The nonce allows multiple people (or TeamCity builds) to
 	// be running this test without interfering with one another.
-	return fmt.Sprintf("gs://cockroachdb-backup-testing/mixed-version/%s_%s?AUTH=implicit", bc.name, bc.nonce)
+	return mixedVersionBackupURI(fmt.Sprintf("%s_%s", bc.name, bc.nonce))
 }
 
 func (bc *backupCollection) encryptionOption() *encryptionPassphrase {
@@ -1043,6 +1058,13 @@ func (*mixedVersionBackup) setShortJobIntervals(
 	})
 }
 
+func (mvb *mixedVersionBackup) waitForTablesToLoad(l *logger.Logger) {
+	for !mvb.tablesLoaded.Load() {
+		l.Printf("waiting for user tables to be loaded...")
+		time.Sleep(2 * time.Second)
+	}
+}
+
 // systemTableWriter will run random statements that lead to data
 // being written to system.* tables. The frequency of these writes
 // (and the data written) are randomized. This function is expected to
@@ -1058,11 +1080,8 @@ func (*mixedVersionBackup) setShortJobIntervals(
 func (mvb *mixedVersionBackup) systemTableWriter(
 	ctx context.Context, l *logger.Logger, rng *rand.Rand, h *mixedversion.Helper,
 ) error {
-	for !mvb.tablesLoaded.Load() {
-		l.Printf("waiting for user tables to be loaded...")
-		time.Sleep(10 * time.Second)
-	}
-	l.Printf("user tables loaded, starting random inserts")
+	mvb.waitForTablesToLoad(l)
+	l.Printf("starting random inserts")
 
 	type systemOperation func() error
 	// addComment will run a `COMMENT ON (DATABASE|TABLE)` statement. It
@@ -1237,6 +1256,57 @@ func (mvb *mixedVersionBackup) setClusterSettings(
 		stmt := fmt.Sprintf("SET CLUSTER SETTING %s = '%s'", setting, value)
 		if err := h.Exec(rng, stmt); err != nil {
 			return err
+		}
+	}
+
+	return nil
+}
+
+func (mvb *mixedVersionBackup) createChangefeeds(
+	ctx context.Context, l *logger.Logger, rng *rand.Rand, h *mixedversion.Helper,
+) error {
+	const maxChangefeeds = 3
+	numChangefeeds := rng.Intn(maxChangefeeds + 1)
+	if numChangefeeds == 0 {
+		l.Printf("skipping changefeed creation")
+		return nil
+	}
+
+	if err := h.Exec(rng, "SET CLUSTER SETTING kv.rangefeed.enabled = true"); err != nil {
+		return err
+	}
+
+	mvb.waitForTablesToLoad(l)
+
+	l.Printf("creating %d changefeeds", numChangefeeds)
+	possibleOptions := [][2]string{
+		{"diff", ""},
+		{"updated", ""},
+		{"resolved", "'10s'"},
+		{"full_table_name", ""},
+		{"schema_change_events", "'column_changes'"},
+	}
+
+	const maxOptions = 2
+	for j := 0; j < numChangefeeds; j++ {
+		rng.Shuffle(len(possibleOptions), func(i, j int) {
+			possibleOptions[i], possibleOptions[j] = possibleOptions[j], possibleOptions[i]
+		})
+		numOptions := rng.Intn(maxOptions + 1)
+		options := map[string]string{}
+		for _, opt := range possibleOptions[:numOptions] {
+			options[opt[0]] = opt[1]
+		}
+
+		db, table := randomTable(rng, mvb.dbs, mvb.tables)
+		target := fmt.Sprintf("%s.%s", db, table)
+		sinkURL := mixedVersionBackupURI(fmt.Sprintf("changefeed_%s", newNonce()))
+		stmt, args := newChangefeedCreator(nil, target, sinkURL).
+			With(options).
+			SQL()
+
+		if err := h.Exec(rng, stmt, args...); err != nil {
+			return fmt.Errorf("error creating changefeed: %w", err)
 		}
 	}
 
@@ -2046,7 +2116,7 @@ func registerBackupMixedVersion(r registry.Registry) {
 			// numWarehouses is picked as a number that provides enough work
 			// for the cluster used in this test without overloading it,
 			// which can make the backups take much longer to finish.
-			const numWarehouses = 100
+			const numWarehouses = 80
 			tpccInit := roachtestutil.NewCommand("./cockroach workload init tpcc").
 				Arg("{pgurl%s}", roachNodes).
 				Flag("warehouses", numWarehouses)
@@ -2071,6 +2141,7 @@ func registerBackupMixedVersion(r registry.Registry) {
 			mvt.OnStartup("set short job interval", backupTest.setShortJobIntervals)
 			mvt.OnStartup("take backup in previous version", backupTest.takePreviousVersionBackup)
 			mvt.OnStartup("maybe set custom cluster settings", backupTest.setClusterSettings)
+			mvt.OnStartup("create some changefeeds", backupTest.createChangefeeds)
 
 			// We start two workloads in this test:
 			// - bank: the main purpose of this workload is to test some
