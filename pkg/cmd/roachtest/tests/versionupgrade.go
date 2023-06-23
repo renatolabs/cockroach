@@ -103,7 +103,7 @@ func runVersionUpgrade(ctx context.Context, t test.Test, c cluster.Cluster) {
 	mvt := mixedversion.NewTest(ctx, t, t.L(), c, c.All())
 	mvt.OnStartup("setup schema changer workload", func(ctx context.Context, l *logger.Logger, r *rand.Rand, helper *mixedversion.Helper) error {
 		// Execute the workload init.
-		return c.RunE(ctx, c.All(), "./workload init schemachange")
+		return c.RunE(ctx, c.All(), fmt.Sprintf("./workload init schemachange {pgurl%s}", c.All()))
 	})
 	mvt.InMixedVersion("run backup", func(ctx context.Context, l *logger.Logger, rng *rand.Rand, h *mixedversion.Helper) error {
 		// Verify that backups can be created in various configurations. This is
