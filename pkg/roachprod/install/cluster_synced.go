@@ -23,6 +23,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -524,6 +525,8 @@ func (c *SyncedCluster) Wipe(ctx context.Context, l *logger.Logger, preserveCert
 			}
 
 			cmd = strings.Join(rmCmds, " && ")
+			l.Printf("preserveCerts: %t | cmd: %s", preserveCerts, cmd)
+			l.Printf("stack:\n%s", debug.Stack())
 		}
 		sess := c.newSession(l, node, cmd, withDebugName("node-wipe"))
 		defer sess.Close()
@@ -1537,6 +1540,7 @@ func (c *SyncedCluster) fileExistsOnFirstNode(
 	// character in the output, allowing us to compare it directly with
 	// "0".
 	result, err := c.runCmdOnSingleNode(ctx, l, 1, `$(test -e `+path+`); echo -n $?`, false, l.Stdout, l.Stderr)
+	l.Printf("RESULT: %#v", result)
 	return result.Stdout == "0", err
 }
 
