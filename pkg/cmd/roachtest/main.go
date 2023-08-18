@@ -586,34 +586,42 @@ func getUser(userFlag string) string {
 func CtrlC(ctx context.Context, l *logger.Logger, cancel func(), cr *clusterRegistry) {
 	// Shut down test clusters when interrupted (for example CTRL-C).
 	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, os.Interrupt)
+	signal.Notify(sig)
 	go func() {
-		<-sig
-		shout(ctx, l, os.Stderr,
-			"Signaled received. Canceling workers and waiting up to 5s for them.")
-		// Signal runner.Run() to stop.
-		cancel()
-		<-time.After(5 * time.Second)
-		shout(ctx, l, os.Stderr, "5s elapsed. Will brutally destroy all clusters.")
-		// Make sure there are no leftover clusters.
-		destroyCh := make(chan struct{})
-		go func() {
-			// Destroy all clusters. Don't wait more than 5 min for that though.
-			destroyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-			l.PrintfCtx(ctx, "CtrlC handler destroying all clusters")
-			cr.destroyAllClusters(destroyCtx, l)
+		for {
+			l.Printf("waiting for signals...")
+			s := <-sig
+			if s != os.Interrupt {
+				l.Printf("got %s, ignoring", s)
+				continue
+			}
+			l.Printf("got signal: %v", s)
+			shout(ctx, l, os.Stderr,
+				"Signal received. Canceling workers and waiting up to 5s for them.")
+			// Signal runner.Run() to stop.
 			cancel()
-			close(destroyCh)
-		}()
-		// If we get a second CTRL-C, exit immediately.
-		select {
-		case <-sig:
-			shout(ctx, l, os.Stderr, "Second SIGINT received. Quitting. Cluster might be left behind.")
-		case <-destroyCh:
-			shout(ctx, l, os.Stderr, "Done destroying all clusters.")
+			<-time.After(5 * time.Second)
+			shout(ctx, l, os.Stderr, "5s elapsed. Will brutally destroy all clusters.")
+			// Make sure there are no leftover clusters.
+			destroyCh := make(chan struct{})
+			go func() {
+				// Destroy all clusters. Don't wait more than 5 min for that though.
+				destroyCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+				l.PrintfCtx(ctx, "CtrlC handler destroying all clusters")
+				cr.destroyAllClusters(destroyCtx, l)
+				cancel()
+				close(destroyCh)
+			}()
+			// If we get a second CTRL-C, exit immediately.
+			select {
+			case <-sig:
+				shout(ctx, l, os.Stderr, "Second SIGINT received. Quitting. Cluster might be left behind.")
+			case <-destroyCh:
+				shout(ctx, l, os.Stderr, "Done destroying all clusters.")
+			}
+			l.Printf("all stacks:\n\n%s\n", allstacks.Get())
+			os.Exit(2)
 		}
-		l.Printf("all stacks:\n\n%s\n", allstacks.Get())
-		os.Exit(2)
 	}()
 }
 
