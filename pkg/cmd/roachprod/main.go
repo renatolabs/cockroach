@@ -519,10 +519,11 @@ var startTenantCmd = &cobra.Command{
 	Short: "start a tenant",
 	Long: `Start SQL instances for a non-system tenant.
 
-The --host-cluster flag must be used to specify a host cluster (with optional
-node selector) which is already running. The command will create the tenant on
-the host cluster if it does not exist already. The host and tenant can use the
-same underlying cluster, as long as different subsets of nodes are selected.
+The --host-cluster flag must be used to specify a host cluster (with
+optional node selector) which is already running. The command will
+create the tenant on the host cluster if it does not exist already. If
+creating multiple instances on the same node, --tenant-instance flag
+must be passed to differentiate them.
 
 The --tenant-id flag can be used to specify the tenant ID; it defaults to 2.
 
