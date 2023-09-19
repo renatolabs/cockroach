@@ -48,6 +48,7 @@ var (
 	listPattern           string
 	secure                = false
 	tenantName            string
+	tenantID              int
 	tenantInstance        int
 	extraSSHOptions       = ""
 	nodeEnv               []string
@@ -216,9 +217,15 @@ Default is "RECURRING '*/15 * * * *' FULL BACKUP '@hourly' WITH SCHEDULE OPTIONS
 	startTenantCmd.Flags().IntVar(&startOpts.TenantInstance,
 		"tenant-instance", 0, "specific tenant instance to connect to")
 
-	stopCmd.Flags().IntVar(&sig, "sig", sig, "signal to pass to kill")
-	stopCmd.Flags().BoolVar(&waitFlag, "wait", waitFlag, "wait for processes to exit")
-	stopCmd.Flags().IntVar(&maxWait, "max-wait", maxWait, "approx number of seconds to wait for processes to exit")
+	// Flags for processes that stop (kill) processes.
+	for _, stopProcessesCmd := range []*cobra.Command{stopCmd, stopTenantCmd} {
+		stopProcessesCmd.Flags().IntVar(&sig, "sig", sig, "signal to pass to kill")
+		stopProcessesCmd.Flags().BoolVar(&waitFlag, "wait", waitFlag, "wait for processes to exit")
+		stopProcessesCmd.Flags().IntVar(&maxWait, "max-wait", maxWait, "approx number of seconds to wait for processes to exit")
+	}
+
+	stopTenantCmd.Flags().IntVarP(&tenantID, "tenant-id", "t", tenantID, "tenant ID")
+	stopTenantCmd.Flags().IntVar(&tenantInstance, "tenant-instance", 0, "tenant instance to stop")
 
 	syncCmd.Flags().BoolVar(&listOpts.IncludeVolumes, "include-volumes", false, "Include volumes when syncing")
 

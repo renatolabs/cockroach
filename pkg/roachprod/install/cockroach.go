@@ -563,6 +563,7 @@ func (c *SyncedCluster) generateStartCmd(
 		Args:          args,
 		MemoryMax:     config.MemoryMax,
 		NumFilesLimit: startOpts.NumFilesLimit,
+		TenantLabel:   TenantLabel(startOpts.TenantName, startOpts.TenantInstance),
 		Local:         c.IsLocal(),
 	})
 }
@@ -574,8 +575,28 @@ type startTemplateData struct {
 	KeyCmd        string
 	MemoryMax     string
 	NumFilesLimit int64
+	TenantLabel   string
 	Args          []string
 	EnvVars       []string
+}
+
+func systemctlUnitName(tenantName string, tenantInstance int) string {
+	if tenantName == "" || tenantName == SystemTenantName {
+		return "cockroach-system"
+	}
+
+	return fmt.Sprintf("cockroach-%s-%d", tenantName, tenantInstance)
+}
+
+// TenantLabel is the value used to "label" tenant (cockroach)
+// processes running locally or in a VM. This is used by roachprod to
+// monitor identify such processes and monitor them.
+func TenantLabel(tenantName string, tenantInstance int) string {
+	if tenantName == "" || tenantName == SystemTenantName {
+		return "cockroach-system"
+	}
+
+	return fmt.Sprintf("cockroach-%s_%d", tenantName, tenantInstance)
 }
 
 func execStartTemplate(data startTemplateData) (string, error) {

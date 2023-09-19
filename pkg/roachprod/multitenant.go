@@ -49,8 +49,7 @@ func StartTenant(
 	if startOpts.TenantID < 2 {
 		return errors.Errorf("invalid tenant ID %d (must be 2 or higher)", startOpts.TenantID)
 	}
-	// TODO(herko): Allow users to pass in a tenant name.
-	startOpts.TenantName = fmt.Sprintf("tenant-%d", startOpts.TenantID)
+	startOpts.TenantName = defaultTenantName(startOpts.TenantID)
 
 	// Create tenant, if necessary. We need to run this SQL against a single host.
 	l.Printf("Creating tenant metadata")
@@ -73,6 +72,27 @@ func StartTenant(
 	startOpts.KVAddrs = strings.Join(kvAddrs, ",")
 	startOpts.KVCluster = hc
 	return tc.Start(ctx, l, startOpts)
+}
+
+// StopTenant stops SQL instance processes on the tenantCluster given.
+func StopTenant(
+	ctx context.Context, l *logger.Logger, tenantCluster string, stopOpts StopOpts,
+) error {
+	tc, err := newCluster(l, tenantCluster)
+	if err != nil {
+		return err
+	}
+
+	stopOpts.TenantName = defaultTenantName(stopOpts.TenantID)
+	tenant := install.TenantLabel(stopOpts.TenantName, stopOpts.TenantInstance)
+	return tc.Stop(ctx, l, stopOpts.Sig, stopOpts.Wait, stopOpts.MaxWait, tenant)
+}
+
+// defaultTenantname returns the tenant name used for the tenant with
+// ID given.
+// TODO(herko): Allow users to pass in a tenant name.
+func defaultTenantName(tenantID int) string {
+	return fmt.Sprintf("tenant-%d", tenantID)
 }
 
 // createTenantIfNotExistsQuery is used to initialize the tenant metadata, if
