@@ -22,6 +22,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -399,7 +400,7 @@ func (c *SyncedCluster) newSession(
 //
 // It sends a signal to all processes that have been started with ROACHPROD env
 // var and optionally waits until the processes stop. If the tenantLabel is
-// not empty, then only tenant processes with a matching labels are stopped.
+// not empty, then only tenant processes with a matching label are stopped.
 //
 // When running roachprod stop without other flags, the signal is 9 (SIGKILL)
 // and wait is true.
@@ -409,7 +410,16 @@ func (c *SyncedCluster) newSession(
 func (c *SyncedCluster) Stop(
 	ctx context.Context, l *logger.Logger, sig int, wait bool, maxWait int, tenantLabel string,
 ) error {
-	display := fmt.Sprintf("%s: stopping", c.Name)
+	var tenantDisplay string
+	if tenantLabel != "" {
+		tenantName, tenantInstance, err := TenantInfoFromLabel(tenantLabel)
+		if err != nil {
+			return err
+		}
+
+		tenantDisplay = fmt.Sprintf(" tenant %q, instance %d", tenantName, tenantInstance)
+	}
+	display := fmt.Sprintf("%s: stopping%s", c.Name, tenantDisplay)
 	if wait {
 		display += " and waiting"
 	}
@@ -582,18 +592,26 @@ fi
 	return statuses, nil
 }
 
-// MonitorNodeSkipped represents a node whose status was not checked.
-type MonitorNodeSkipped struct{}
-
-// MonitorNodeRunning represents the cockroach process running on a
-// node.
-type MonitorNodeRunning struct {
-	PID string
+// MonitorTenantSkipped represents a cockroach process whose status
+// was not checked.
+type MonitorTenantSkipped struct {
+	TenantName     string
+	TenantInstance int
 }
 
-// MonitorNodeDead represents the cockroach process dying on a node.
-type MonitorNodeDead struct {
-	ExitCode string
+// MonitorTenantRunning represents the cockroach process running on a
+// node.
+type MonitorTenantRunning struct {
+	TenantName     string
+	TenantInstance int
+	PID            string
+}
+
+// MonitorTenantDead represents the cockroach process dying on a node.
+type MonitorTenantDead struct {
+	TenantName     string
+	TenantInstance int
+	ExitCode       string
 }
 
 type MonitorError struct {
@@ -616,13 +634,25 @@ type NodeMonitorInfo struct {
 func (nmi NodeMonitorInfo) String() string {
 	var status string
 
+	tenantDesc := func(name string, instance int) string {
+		if name == SystemTenantName {
+			return "system tenant"
+		}
+
+		return fmt.Sprintf("tenant %q, instance %d", name, instance)
+	}
+
 	switch event := nmi.Event.(type) {
-	case MonitorNodeRunning:
-		status = fmt.Sprintf("cockroach process is running (PID: %s)", event.PID)
-	case MonitorNodeSkipped:
-		status = "node skipped"
-	case MonitorNodeDead:
-		status = fmt.Sprintf("cockroach process died (exit code %s)", event.ExitCode)
+	case MonitorTenantRunning:
+		status = fmt.Sprintf("cockroach process for %s is running (PID: %s)",
+			tenantDesc(event.TenantName, event.TenantInstance), event.PID,
+		)
+	case MonitorTenantSkipped:
+		status = fmt.Sprintf("%s was skipped", tenantDesc(event.TenantName, event.TenantInstance))
+	case MonitorTenantDead:
+		status = fmt.Sprintf("cockroach process for %s died (exit code %s)",
+			tenantDesc(event.TenantName, event.TenantInstance), event.ExitCode,
+		)
 	case MonitorError:
 		status = fmt.Sprintf("error: %s", event.Err.Error())
 	}
@@ -644,9 +674,14 @@ type MonitorOpts struct {
 // channel is subsequently closed; otherwise the process continues indefinitely
 // (emitting new information as the status of the cockroach process changes).
 //
-// If IgnoreEmptyNodes is true, nodes on which no CockroachDB data is found
-// (in {store-dir}) will not be probed and single event, MonitorNodeSkipped,
-// will be emitted for them.
+// If IgnoreEmptyNodes is true, tenants on which no CockroachDB data is found
+// (in {store-dir}) will not be probed and single event, MonitorTenantSkipped,
+// will be emitted for each tenant.
+//
+// Note that the monitor will only send events for tenants that exist
+// at the time this function is called. In other words, this function
+// will not emit events for tenants started *after* a call to
+// Monitor().
 func (c *SyncedCluster) Monitor(
 	l *logger.Logger, ctx context.Context, opts MonitorOpts,
 ) chan NodeMonitorInfo {
@@ -674,39 +709,81 @@ func (c *SyncedCluster) Monitor(
 		deadMsg    = "dead"
 	)
 
+	wg.Add(len(nodes))
 	for i := range nodes {
-		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-
 			node := nodes[i]
-			port, err := c.NodePort(ctx, node)
-			if err != nil {
-				err := errors.Wrap(err, "failed to get node port")
+
+			// We first find out all tenant processes (including system
+			// tenant) that are currently running in this node.
+			cockroachTenantsCmd := fmt.Sprintf(`ps axeww -o command | `+
+				`grep -E '%s' | `+ // processes started by roachprod
+				`grep -E -o 'ROACHPROD_TENANT=[^ ]*' | `+ // ROACHPROD_TENANT indicates this is a cockroach process
+				`cut -d= -f2`, // grab the tenant label
+				c.roachprodEnvRegex(node),
+			)
+
+			result, err := c.runCmdOnSingleNode(
+				ctx, l, node, cockroachTenantsCmd, defaultCmdOpts("list-tenants"),
+			)
+			if err := errors.CombineErrors(err, result.Err); err != nil {
+				err := errors.Wrap(err, "failed to list tenants")
 				sendEvent(NodeMonitorInfo{Node: node, Event: MonitorError{err}})
 				return
 			}
-			// On each monitored node, we loop looking for a cockroach process.
+
+			type tenantInfo struct {
+				Name     string
+				Instance int
+			}
+
+			var tenants []tenantInfo
+			tenantLines := strings.TrimSuffix(result.CombinedOut, "\n")
+			if tenantLines == "" {
+				err := errors.New("no cockroach processes running")
+				sendEvent(NodeMonitorInfo{Node: node, Event: MonitorError{err}})
+				return
+			}
+			for _, label := range strings.Split(tenantLines, "\n") {
+				name, instance, err := TenantInfoFromLabel(label)
+				if err != nil {
+					sendEvent(NodeMonitorInfo{Node: node, Event: MonitorError{err}})
+					return
+				}
+				tenants = append(tenants, tenantInfo{name, instance})
+			}
+
 			data := struct {
 				OneShot     bool
+				Node        Node
 				IgnoreEmpty bool
 				Store       string
-				Port        int
 				Local       bool
 				Separator   string
 				SkippedMsg  string
 				RunningMsg  string
 				DeadMsg     string
+				Tenants     []tenantInfo
 			}{
 				OneShot:     opts.OneShot,
+				Node:        node,
 				IgnoreEmpty: opts.IgnoreEmptyNodes,
 				Store:       c.NodeDir(node, 1 /* storeIndex */),
-				Port:        port,
 				Local:       c.IsLocal(),
 				Separator:   separator,
 				SkippedMsg:  skippedMsg,
 				RunningMsg:  runningMsg,
 				DeadMsg:     deadMsg,
+				Tenants:     tenants,
+			}
+
+			storeFor := func(tenantName string, tenantInstance int) string {
+				return c.TenantStoreDir(node, tenantName, tenantInstance)
+			}
+
+			localPIDFile := func(tenantName string, tenantInstance int) string {
+				return filepath.Join(c.LogDir(node, tenantName, tenantInstance), "cockroach.pid")
 			}
 
 			// NB.: we parse the output of every line this script
@@ -714,62 +791,85 @@ func (c *SyncedCluster) Monitor(
 			// down below in order to produce structured results to the
 			// caller.
 			snippet := `
-{{ if .IgnoreEmpty }}
-if ! ls {{.Store}}/marker.* 1> /dev/null 2>&1; then
-  echo "{{.SkippedMsg}}"
-  exit 0
-fi
-{{- end}}
-# Init with -1 so that when cockroach is initially dead, we print
-# a dead event for it.
-lastpid=-1
-while :; do
-{{ if .Local }}
-  pid=$(lsof -i :{{.Port}} -sTCP:LISTEN | awk '!/COMMAND/ {print $2}')
-	pid=${pid:-0} # default to 0
-	status="unknown"
-{{- else }}
-  # When CRDB is not running, this is zero.
-	pid=$(systemctl show cockroach --property MainPID --value)
-	status=$(systemctl show cockroach --property ExecMainStatus --value)
-{{- end }}
-  if [[ "${lastpid}" == -1 && "${pid}" != 0 ]]; then
-    # On the first iteration through the loop, if the process is running,
-    # don't register a PID change (which would trigger an erroneous dead
-    # event).
-    lastpid=0
+{{ range .Tenants }}
+monitor_tenant_{{$.Node}}_{{.Name}}_{{.Instance}}() {
+  {{ if $.IgnoreEmpty }}
+  if ! ls {{storeFor .Name .Instance}}/marker.* 1> /dev/null 2>&1; then
+    echo "{{.Name}}{{$.Separator}}{{.Instance}}{{$.Separator}}{{$.SkippedMsg}}"
+    return 0
   fi
-  # Output a dead event whenever the PID changes from a nonzero value to
-  # any other value. In particular, we emit a dead event when the node stops
-  # (lastpid is nonzero, pid is zero), but not when the process then starts
-  # again (lastpid is zero, pid is nonzero).
-  if [ "${pid}" != "${lastpid}" ]; then
-    if [ "${lastpid}" != 0 ]; then
-      if [ "${pid}" != 0 ]; then
-        # If the PID changed but neither is zero, then the status refers to
-        # the new incarnation. We lost the actual exit status of the old PID.
-        status="unknown"
+  {{- end}}
+  # Init with -1 so that when cockroach is initially dead, we print
+  # a dead event for it.
+  lastpid=-1
+  while :; do
+    {{ if $.Local }}
+    pidFile=$(cat "{{pidFile .Name .Instance}}")
+    # Make sure the process is still running
+    pid=$(ps axeww -o pid -o command | grep ROACHPROD= | grep ${pidFile} | awk '{ print $1 }')
+    pid=${pid:-0} # default to 0
+    status="unknown"
+    {{- else }}
+    # When CRDB is not running, this is zero.
+    pid=$(systemctl show "{{tenantLabel .Name .Instance}}" --property MainPID --value)
+    status=$(systemctl show "{{tenantLabel .Name .Instance}}" --property ExecMainStatus --value)
+    {{- end }}
+    if [[ "${lastpid}" == -1 && "${pid}" != 0 ]]; then
+      # On the first iteration through the loop, if the process is running,
+      # don't register a PID change (which would trigger an erroneous dead
+      # event).
+      lastpid=0
+    fi
+    # Output a dead event whenever the PID changes from a nonzero value to
+    # any other value. In particular, we emit a dead event when the node stops
+    # (lastpid is nonzero, pid is zero), but not when the process then starts
+    # again (lastpid is zero, pid is nonzero).
+    if [ "${pid}" != "${lastpid}" ]; then
+      if [ "${lastpid}" != 0 ]; then
+        if [ "${pid}" != 0 ]; then
+          # If the PID changed but neither is zero, then the status refers to
+          # the new incarnation. We lost the actual exit status of the old PID.
+          status="unknown"
+        fi
+    	  echo "{{.Name}}{{$.Separator}}{{.Instance}}{{$.Separator}}{{$.DeadMsg}}{{$.Separator}}${status}"
       fi
-    	echo "{{.DeadMsg}}{{.Separator}}${status}"
+  	  if [ "${pid}" != 0 ]; then
+  		  echo "{{.Name}}{{$.Separator}}{{.Instance}}{{$.Separator}}{{$.RunningMsg}}{{$.Separator}}${pid}"
+      fi
+      lastpid=${pid}
     fi
-		if [ "${pid}" != 0 ]; then
-			echo "{{.RunningMsg}}{{.Separator}}${pid}"
+    {{ if $.OneShot }}
+      return 0
+    {{- end }}
+    sleep 1
+    if [ "${pid}" != 0 ]; then
+      while kill -0 "${pid}"; do
+        sleep 1
+      done
     fi
-    lastpid=${pid}
-  fi
-{{ if .OneShot }}
-  exit 0
-{{- end }}
-  sleep 1
-  if [ "${pid}" != 0 ]; then
-    while kill -0 "${pid}"; do
-      sleep 1
-    done
-  fi
-done
+  done
+}
+{{ end }}
+
+# make sure all tenant monitors quit when this script exits. In
+# OneShot mode, this is not needed as the script should end on its own.
+{{ if not .OneShot }}
+trap "kill 0" EXIT
+{{ end }}
+
+# monitor every tenant in parallel.
+{{ range .Tenants }}
+monitor_tenant_{{$.Node}}_{{.Name}}_{{.Instance}} &
+{{ end }}
+
+wait
 `
 
-			t := template.Must(template.New("script").Parse(snippet))
+			t := template.Must(template.New("script").Funcs(template.FuncMap{
+				"storeFor":    storeFor,
+				"pidFile":     localPIDFile,
+				"tenantLabel": TenantLabel,
+			}).Parse(snippet))
 			var buf bytes.Buffer
 			if err := t.Execute(&buf, data); err != nil {
 				err := errors.Wrap(err, "failed to execute template")
@@ -785,7 +885,6 @@ done
 			if err != nil {
 				err := errors.Wrap(err, "failed to read stdout pipe")
 				sendEvent(NodeMonitorInfo{Node: node, Event: MonitorError{err}})
-				wg.Done()
 				return
 			}
 			// Request a PTY so that the script will receive a SIGPIPE when the
@@ -796,10 +895,9 @@ done
 				return
 			}
 
-			var readerWg sync.WaitGroup
-			readerWg.Add(1)
+			readerDone := make(chan struct{})
 			go func(p io.Reader) {
-				defer readerWg.Done()
+				defer close(readerDone)
 				r := bufio.NewReader(p)
 				for {
 					line, _, err := r.ReadLine()
@@ -809,18 +907,29 @@ done
 					if err != nil {
 						err := errors.Wrap(err, "error reading from session")
 						sendEvent(NodeMonitorInfo{Node: node, Event: MonitorError{err}})
+						return
 					}
 
 					parts := strings.Split(string(line), separator)
-					switch parts[0] {
+					// Tenant name and instance are the first fields of every
+					// event type.
+					name, instanceStr := parts[0], parts[1]
+					instance, _ := strconv.Atoi(instanceStr)
+					switch parts[2] {
 					case skippedMsg:
-						sendEvent(NodeMonitorInfo{Node: node, Event: MonitorNodeSkipped{}})
+						sendEvent(NodeMonitorInfo{Node: node, Event: MonitorTenantSkipped{
+							TenantName: name, TenantInstance: instance,
+						}})
 					case runningMsg:
-						pid := parts[1]
-						sendEvent(NodeMonitorInfo{Node: node, Event: MonitorNodeRunning{pid}})
+						pid := parts[3]
+						sendEvent(NodeMonitorInfo{Node: node, Event: MonitorTenantRunning{
+							TenantName: name, TenantInstance: instance, PID: pid,
+						}})
 					case deadMsg:
-						exitCode := parts[1]
-						sendEvent(NodeMonitorInfo{Node: node, Event: MonitorNodeDead{exitCode}})
+						exitCode := parts[3]
+						sendEvent(NodeMonitorInfo{Node: node, Event: MonitorTenantDead{
+							TenantName: name, TenantInstance: instance, ExitCode: exitCode,
+						}})
 					default:
 						err := fmt.Errorf("internal error: unrecognized output from monitor: %s", line)
 						sendEvent(NodeMonitorInfo{Node: node, Event: MonitorError{err}})
@@ -834,17 +943,13 @@ done
 				return
 			}
 
-			// Watch for context cancellation, which can happen either if
-			// the test fails, or if the monitor loop exits.
+			// Watch for context cancellation, which can happen if the test
+			// fails, or if the monitor loop exits.
 			go func() {
 				<-monitorCtx.Done()
 				sess.Close()
 			}()
 
-			readerWg.Wait()
-			// We must call `sess.Wait()` only after finishing reading from the stdout
-			// pipe. Otherwise it can be closed under us, causing the reader to loop
-			// infinitely receiving a non-`io.EOF` error.
 			if err := sess.Wait(); err != nil {
 				// If we got an error waiting for the session but the context
 				// is already canceled, do not send an error through the
@@ -860,6 +965,8 @@ done
 				sendEvent(NodeMonitorInfo{Node: node, Event: MonitorError{err}})
 				return
 			}
+
+			<-readerDone
 		}(i)
 	}
 	go func() {

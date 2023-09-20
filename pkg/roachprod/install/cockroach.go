@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"text/template"
 
@@ -580,23 +581,53 @@ type startTemplateData struct {
 	EnvVars       []string
 }
 
-func systemctlUnitName(tenantName string, tenantInstance int) string {
-	if tenantName == "" || tenantName == SystemTenantName {
-		return "cockroach-system"
-	}
-
-	return fmt.Sprintf("cockroach-%s-%d", tenantName, tenantInstance)
-}
-
 // TenantLabel is the value used to "label" tenant (cockroach)
 // processes running locally or in a VM. This is used by roachprod to
-// monitor identify such processes and monitor them.
+// identify such processes and monitor them.
 func TenantLabel(tenantName string, tenantInstance int) string {
 	if tenantName == "" || tenantName == SystemTenantName {
 		return "cockroach-system"
 	}
 
 	return fmt.Sprintf("cockroach-%s_%d", tenantName, tenantInstance)
+}
+
+// TenantInfoFromLabel takes as parameter a tenant label produced with
+// `TenantLabel()` and returns the corresponding tenant name and
+// instance.
+func TenantInfoFromLabel(tenantLabel string) (string, int, error) {
+	var (
+		tenantInstance       int
+		tenantInstanceStr    string
+		labelWithoutInstance string
+		err                  error
+	)
+
+	sep := "_"
+	parts := strings.Split(tenantLabel, sep)
+
+	// Note that this logic assumes that tenant names cannot have a '_'
+	// character, which is currently (Sep 2023) the case.
+	switch len(parts) {
+	case 1:
+		// This should be a system tenant (no instance identifier)
+		labelWithoutInstance = parts[0]
+
+	case 2:
+		// App tenant process: instance number is after the '_' character.
+		labelWithoutInstance, tenantInstanceStr = parts[0], parts[1]
+		tenantInstance, err = strconv.Atoi(tenantInstanceStr)
+		if err != nil {
+			return "", 0, fmt.Errorf("invalid tenant label: %s", tenantLabel)
+		}
+
+	default:
+		return "", 0, fmt.Errorf("invalid tenant label: %s", tenantLabel)
+	}
+
+	// Remove the "cockroach-" prefix added by TenantLabel.
+	tenantName := strings.TrimPrefix(labelWithoutInstance, "cockroach-")
+	return tenantName, tenantInstance, nil
 }
 
 func execStartTemplate(data startTemplateData) (string, error) {
