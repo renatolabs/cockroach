@@ -694,6 +694,7 @@ func (c *SyncedCluster) Monitor(
 	// that is listened to by the caller. Bails if the context is
 	// canceled.
 	sendEvent := func(info NodeMonitorInfo) {
+		l.Printf("sending event: %s (ctx closed: %#v)", info, ctx.Err())
 		select {
 		case ch <- info:
 			// We were able to send the info through the channel.
@@ -946,8 +947,11 @@ wait
 			// Watch for context cancellation, which can happen if the test
 			// fails, or if the monitor loop exits.
 			go func() {
+				l.Printf("%d: waiting for monitor to close", node)
 				<-monitorCtx.Done()
+				l.Printf("%d: MONITOR CONTEXT CLOSED", node)
 				sess.Close()
+				l.Printf("%d: SESSION CLOSED", node)
 			}()
 
 			if err := sess.Wait(); err != nil {
@@ -966,13 +970,18 @@ wait
 				return
 			}
 
+			l.Printf("%d: WAITING FOR READER", node)
 			<-readerDone
+			l.Printf("%d: READER FINISHED", node)
 		}(i)
 	}
 	go func() {
 		wg.Wait()
+		l.Printf("OUTER WG FINISHED")
 		cancel()
+		l.Printf("CANCELING CONTEXT")
 		close(ch)
+		l.Printf("CLOSING CHANNEL")
 	}()
 
 	return ch
