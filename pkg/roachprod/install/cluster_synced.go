@@ -823,6 +823,10 @@ monitor_process_{{$.Node}}_{{.Name}}_{{.Instance}}() {
   # a dead event for it.
   lastpid=-1
   while :; do
+    # if parent process terminated, quite as well.
+    if ! $(ps -p "$1" >/dev/null); then
+      return 0
+    fi
     {{ if $.Local }}
     pidFile=$(cat "{{pidFile .Name .Instance}}")
     # Make sure the process is still running
@@ -871,15 +875,9 @@ monitor_process_{{$.Node}}_{{.Name}}_{{.Instance}}() {
 }
 {{ end }}
 
-# make sure all process monitors quit when this script exits. In
-# OneShot mode, this is not needed as the script should end on its own.
-{{ if not .OneShot }}
-trap "kill 0" EXIT
-{{ end }}
-
 # monitor every cockroach process in parallel.
 {{ range .Processes }}
-monitor_process_{{$.Node}}_{{.Name}}_{{.Instance}} &
+monitor_process_{{$.Node}}_{{.Name}}_{{.Instance}} \$\$ &
 {{ end }}
 
 wait
