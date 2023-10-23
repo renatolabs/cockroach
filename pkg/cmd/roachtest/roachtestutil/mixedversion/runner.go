@@ -66,10 +66,11 @@ type (
 	}
 
 	testFailure struct {
-		summarized     bool
-		description    string
-		seed           int64
-		binaryVersions []roachpb.Version
+		summarized             bool
+		description            string
+		seed                   int64
+		logicalBinaryVersions  []roachpb.Version
+		releasedBinaryVersions []*clusterupgrade.Version
 		// Cluster versions before and after the failure occurred. Before
 		// each step is executed, the test runner will cache each node's
 		// view of the cluster version; after a failure occurs, we'll try
@@ -104,8 +105,9 @@ type (
 		seed      int64
 		logger    *logger.Logger
 
-		binaryVersions  atomic.Value
-		clusterVersions atomic.Value
+		logicalBinaryVersions  atomic.Value
+		releasedBinaryVersions atomic.Value
+		clusterVersions        atomic.Value
 
 		background *backgroundRunner
 		monitor    *crdbMonitor
@@ -192,7 +194,7 @@ func (tr *testRunner) runStep(ctx context.Context, step testStep) error {
 			if err := tr.maybeInitConnections(); err != nil {
 				return err
 			}
-			if err := tr.refreshBinaryVersions(); err != nil {
+			if err := tr.refreshLogicalBinaryVersions(); err != nil {
 				return err
 			}
 			if err := tr.refreshClusterVersions(); err != nil {
@@ -324,11 +326,12 @@ func (tr *testRunner) testFailure(desc string, l *logger.Logger) error {
 	}
 
 	tf := &testFailure{
-		description:           desc,
-		seed:                  tr.seed,
-		binaryVersions:        loadAtomicVersions(tr.binaryVersions),
-		clusterVersionsBefore: loadAtomicVersions(clusterVersionsBefore),
-		clusterVersionsAfter:  loadAtomicVersions(clusterVersionsAfter),
+		description:            desc,
+		seed:                   tr.seed,
+		logicalBinaryVersions:  loadAtomicLogicalVersions(tr.logicalBinaryVersions),
+		releasedBinaryVersions: loadAtomicReleasedVersions(tr.releasedBinaryVersions),
+		clusterVersionsBefore:  loadAtomicLogicalVersions(clusterVersionsBefore),
+		clusterVersionsAfter:   loadAtomicLogicalVersions(clusterVersionsAfter),
 	}
 
 	// Print the test failure on the step's logger for convenience, and
@@ -386,14 +389,16 @@ func (tr *testRunner) logStep(prefix string, step singleStep, l *logger.Logger) 
 // cluster versions on each node. The cached versions should exist for
 // all steps but the first one (when we start the cluster itself).
 func (tr *testRunner) logVersions(l *logger.Logger) {
-	binaryVersions := loadAtomicVersions(tr.binaryVersions)
-	clusterVersions := loadAtomicVersions(tr.clusterVersions)
+	logicalBinaryVersions := loadAtomicLogicalVersions(tr.logicalBinaryVersions)
+	releasedBinaryVersions := loadAtomicReleasedVersions(tr.releasedBinaryVersions)
+	clusterVersions := loadAtomicLogicalVersions(tr.clusterVersions)
 
-	if binaryVersions == nil || clusterVersions == nil {
+	if logicalBinaryVersions == nil || releasedBinaryVersions == nil || clusterVersions == nil {
 		return
 	}
 
-	l.Printf("binary versions: %s", formatVersions(binaryVersions))
+	l.Printf("released binary versions: %s", formatVersions(releasedBinaryVersions))
+	l.Printf("logical binary versions: %s", formatVersions(logicalBinaryVersions))
 	l.Printf("cluster versions: %s", formatVersions(clusterVersions))
 }
 
@@ -409,11 +414,11 @@ func (tr *testRunner) loggerFor(step singleStep) (*logger.Logger, error) {
 	return prefixedLogger(tr.logger, prefix)
 }
 
-// refreshBinaryVersions updates the internal `binaryVersions` field
-// with the binary version running on each node of the cluster. We use
-// the `atomic` package here as this function may be called by two
-// steps that are running concurrently.
-func (tr *testRunner) refreshBinaryVersions() error {
+// refreshLogicalBinaryVersions updates the internal `binaryVersions`
+// field with the binary version running on each node of the
+// cluster. We use the `atomic` package here as this function may be
+// called by two steps that are running concurrently.
+func (tr *testRunner) refreshLogicalBinaryVersions() error {
 	newBinaryVersions := make([]roachpb.Version, 0, len(tr.crdbNodes))
 	for _, node := range tr.crdbNodes {
 		bv, err := clusterupgrade.BinaryVersion(tr.conn(node))
@@ -423,7 +428,7 @@ func (tr *testRunner) refreshBinaryVersions() error {
 		newBinaryVersions = append(newBinaryVersions, bv)
 	}
 
-	tr.binaryVersions.Store(newBinaryVersions)
+	tr.logicalBinaryVersions.Store(newBinaryVersions)
 	return nil
 }
 
@@ -621,7 +626,14 @@ func (tf *testFailure) Error() string {
 		return fmt.Sprintf("%-40s%s", label+":", value)
 	}
 	seedInfo := debugInfo("test random seed", strconv.FormatInt(tf.seed, 10))
-	binaryVersions := debugInfo("binary versions", formatVersions(tf.binaryVersions))
+	releasedBinaryVersions := debugInfo(
+		"released binary versions",
+		formatVersions(tf.releasedBinaryVersions),
+	)
+	logicalBinaryVersions := debugInfo(
+		"logical binary versions",
+		formatVersions(tf.logicalBinaryVersions),
+	)
 	clusterVersionsBefore := debugInfo(
 		"cluster versions before failure",
 		formatVersions(tf.clusterVersionsBefore),
@@ -632,10 +644,14 @@ func (tf *testFailure) Error() string {
 		clusterVersionsAfter = debugInfo("cluster versions after failure", formatVersions(cv))
 	}
 
-	return fmt.Sprintf(
-		"%s\n%s\n%s\n%s%s",
-		tf.description, seedInfo, binaryVersions, clusterVersionsBefore, clusterVersionsAfter,
-	)
+	return strings.Join([]string{
+		tf.description,
+		seedInfo,
+		releasedBinaryVersions,
+		logicalBinaryVersions,
+		clusterVersionsBefore,
+		clusterVersionsAfter,
+	}, "\n")
 }
 
 func renameFailedLogger(l *logger.Logger) error {
@@ -647,12 +663,20 @@ func renameFailedLogger(l *logger.Logger) error {
 	return os.Rename(currentFileName, newLogName)
 }
 
-func loadAtomicVersions(v atomic.Value) []roachpb.Version {
+func loadAtomicLogicalVersions(v atomic.Value) []roachpb.Version {
 	if v.Load() == nil {
 		return nil
 	}
 
 	return v.Load().([]roachpb.Version)
+}
+
+func loadAtomicReleasedVersions(v atomic.Value) []*clusterupgrade.Version {
+	if v.Load() == nil {
+		return nil
+	}
+
+	return v.Load().([]*clusterupgrade.Version)
 }
 
 // panicAsError ensures that the any panics that might happen while
@@ -688,9 +712,27 @@ func waitForChannel(ch chan error, desc string, l *logger.Logger) {
 	}
 }
 
-func formatVersions(versions []roachpb.Version) string {
+// formatVersions prints each version in the `versions` collection;
+// these versions can be logical versions (represented as
+// `roachpb.Version`) or released binary versions (represented as
+// `*clusterupgrade.Version`). Both types implement the `fmt.Stringer`
+// interface, so we use their `String()` implementation here.
+func formatVersions(versions interface{}) string {
+	var formattableVersions []fmt.Stringer
+	switch vs := versions.(type) {
+	case []roachpb.Version:
+		for _, v := range vs {
+			formattableVersions = append(formattableVersions, v)
+		}
+
+	case []*clusterupgrade.Version:
+		for _, v := range vs {
+			formattableVersions = append(formattableVersions, v)
+		}
+	}
+
 	var pairs []string
-	for idx, version := range versions {
+	for idx, version := range formattableVersions {
 		pairs = append(pairs, fmt.Sprintf("%d: %s", idx+1, version))
 	}
 

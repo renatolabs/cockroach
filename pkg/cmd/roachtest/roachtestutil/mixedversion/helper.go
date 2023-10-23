@@ -141,7 +141,7 @@ func (h *Helper) ClusterVersion(rng *rand.Rand) (roachpb.Version, error) {
 		return cv, nil
 	}
 
-	return loadAtomicVersions(h.runner.clusterVersions)[0], nil
+	return loadAtomicLogicalVersions(h.runner.clusterVersions)[0], nil
 }
 
 // ClusterVersionAtLeast checks whether the cluster version is at
