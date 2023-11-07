@@ -572,6 +572,7 @@ func (c *SyncedCluster) ExecSQL(
 			c.NodeURL("localhost", desc.Port, virtualClusterName, desc.ServiceMode) + " " +
 			ssh.Escape(args)
 
+		l.Printf("running cmd: %s", cmd)
 		return c.runCmdOnSingleNode(ctx, l, node, cmd, defaultCmdOpts("run-sql"))
 	}, WithDisplay(display), WithWaitOnFail())
 
