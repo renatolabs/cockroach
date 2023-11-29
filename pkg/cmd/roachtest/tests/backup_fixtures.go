@@ -234,10 +234,9 @@ func registerBackupFixtures(r registry.Registry) {
 			timeout:             5 * time.Hour,
 			initFromBackupSpecs: backupSpecs{version: "v22.2.0"},
 			skip:                "only for fixture generation",
-			// TODO(radu): this should be only AWS.
-			clouds: registry.AllClouds,
-			suites: registry.Suites(registry.Nightly),
-			tags:   registry.Tags("aws"),
+			clouds:              registry.OnlyAWS,
+			suites:              registry.Suites(registry.Nightly),
+			tags:                registry.Tags("aws"),
 		},
 		{
 			// Default Fixture, Run on GCE. Initiated by the tpce --init.
@@ -245,8 +244,7 @@ func registerBackupFixtures(r registry.Registry) {
 			backup: makeBackupFixtureSpecs(scheduledBackupSpecs{
 				backupSpecs: backupSpecs{
 					cloud: spec.GCE}}),
-			// TODO(radu): this should be OnlyGCE.
-			clouds:  registry.AllExceptAWS,
+			clouds:  registry.OnlyGCE,
 			suites:  registry.Suites(registry.Nightly),
 			timeout: 5 * time.Hour,
 			skip:    "only for fixture generation",
