@@ -13,15 +13,18 @@ package tests
 import (
 	"context"
 	"fmt"
+
 	//"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"math/rand"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/clusterupgrade"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/mixedversion"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
+	"github.com/cockroachdb/errors"
 )
 
 func registerSchemaChangeMixedVersions(r registry.Registry) {
@@ -51,7 +54,7 @@ func runSchemaChangeMixedVersions(
 	ctx context.Context, t test.Test, c cluster.Cluster, maxOps int, concurrency int,
 ) {
 	numFeatureRuns := 0
-	mvt := mixedversion.NewTest(ctx, t, t.L(), c, c.All(), mixedversion.NumUpgrades(1))
+	mvt := mixedversion.NewTest(ctx, t, t.L(), c, c.All(), mixedversion.AlwaysUseLatestPredecessors)
 
 	workloadNode := c.Node(c.Spec().NodeCount)
 	c.Put(ctx, t.DeprecatedWorkload(), "./workload", workloadNode)
@@ -60,10 +63,22 @@ func runSchemaChangeMixedVersions(
 	schemaChangeAndValidationStep := func(
 		ctx context.Context, l *logger.Logger, r *rand.Rand, h *mixedversion.Helper,
 	) error {
+		workloadPath, uploaded, err := clusterupgrade.UploadWorkload(
+			ctx, t, l, c, workloadNode, h.Context.ToVersion,
+		)
+		if err != nil {
+			return errors.Wrap(err, "failed to upload workload")
+		}
+
+		if !uploaded {
+			l.Printf("skipping this step as there is no prebuilt version of workload binary")
+			return nil
+		}
+
 		numFeatureRuns += 1
 		l.Printf("Workload step run: %d", numFeatureRuns)
 		workloadSeed := r.Int63()
-		runCmd := roachtestutil.NewCommand("COCKROACH_RANDOM_SEED=%d ./workload run schemachange", workloadSeed).
+		runCmd := roachtestutil.NewCommand("COCKROACH_RANDOM_SEED=%d %s run schemachange", workloadSeed, workloadPath).
 			Flag("verbose", 1).
 			Flag("max-ops", maxOps).
 			Flag("concurrency", concurrency).
@@ -73,21 +88,34 @@ func runSchemaChangeMixedVersions(
 			return err
 		}
 
-		randomNode := h.RandomNode(r, c.All())
-		doctorURL := fmt.Sprintf("{pgurl:%d}", randomNode)
+		var doctorNode int
+		if nodes := h.Context.NodesInPreviousVersion(); len(nodes) > 0 {
+			doctorNode = h.RandomNode(r, nodes)
+		} else {
+			doctorNode = h.RandomNode(r, h.Context.CockroachNodes)
+		}
+
+		doctorURL := fmt.Sprintf("{pgurl:%d}", h.RandomNode(r, h.Context.CockroachNodes))
+		cockroachPath := clusterupgrade.CockroachPathForVersion(t, h.Context.NodeVersion(doctorNode))
 		// Now we validate that nothing is broken after the random schema changes have been run.
-		runCmd = roachtestutil.NewCommand("%s debug doctor examine cluster", test.DefaultCockroachPath).
+		runCmd = roachtestutil.NewCommand("%s debug doctor examine cluster", cockroachPath).
 			Flag("url", doctorURL).
 			String()
 		return c.RunE(ctx,
-			workloadNode,
-			//option.NodeListOption{randomNode},
+			c.Node(doctorNode),
 			runCmd)
 	}
 
 	// Stage our workload node with the schemachange workload.
-	mvt.OnStartup("set up schemachange workload", func(ctx context.Context, l *logger.Logger, r *rand.Rand, helper *mixedversion.Helper) error {
-		return c.RunE(ctx, workloadNode, fmt.Sprintf("./workload init schemachange {pgurl%s}", workloadNode))
+	mvt.OnStartup("set up schemachange workload", func(ctx context.Context, l *logger.Logger, r *rand.Rand, h *mixedversion.Helper) error {
+		workloadPath, _, err := clusterupgrade.UploadWorkload(
+			ctx, t, l, c, workloadNode, h.Context.ToVersion,
+		)
+		if err != nil {
+			return errors.Wrap(err, "failed to upload workload")
+		}
+
+		return c.RunE(ctx, workloadNode, fmt.Sprintf("%s init schemachange {pgurl%s}", workloadPath, workloadNode))
 	})
 
 	mvt.InMixedVersion("run schemachange workload and validation in mixed version", schemaChangeAndValidationStep)
