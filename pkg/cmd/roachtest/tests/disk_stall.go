@@ -14,7 +14,6 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -23,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/failers"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
@@ -36,16 +36,24 @@ const maxSyncDur = 10 * time.Second
 // tests assert that a disk stall is detected and the process crashes
 // appropriately.
 func registerDiskStalledDetection(r registry.Registry) {
-	stallers := map[string]func(test.Test, cluster.Cluster) diskStaller{
-		"dmsetup": func(t test.Test, c cluster.Cluster) diskStaller { return &dmsetupDiskStaller{t: t, c: c} },
-		"cgroup/read-write/logs-too=false": func(t test.Test, c cluster.Cluster) diskStaller {
-			return &cgroupDiskStaller{t: t, c: c, readOrWrite: []bandwidthReadWrite{writeBandwidth, readBandwidth}}
+	stallers := map[string]func(test.Test, cluster.Cluster) failers.DiskStaller{
+		"dmsetup": func(t test.Test, c cluster.Cluster) failers.DiskStaller {
+			return failers.NewDMSetupDiskStaller(t, c)
 		},
-		"cgroup/read-write/logs-too=true": func(t test.Test, c cluster.Cluster) diskStaller {
-			return &cgroupDiskStaller{t: t, c: c, readOrWrite: []bandwidthReadWrite{writeBandwidth, readBandwidth}, logsToo: true}
+		"cgroup/read-write/logs-too=false": func(t test.Test, c cluster.Cluster) failers.DiskStaller {
+			return failers.NewCGroupDiskStaller(
+				t, c, []failers.BandwidthReadWrite{failers.WriteBandwidth, failers.ReadBandwidth}, false,
+			)
 		},
-		"cgroup/write-only/logs-too=true": func(t test.Test, c cluster.Cluster) diskStaller {
-			return &cgroupDiskStaller{t: t, c: c, readOrWrite: []bandwidthReadWrite{writeBandwidth}, logsToo: true}
+		"cgroup/read-write/logs-too=true": func(t test.Test, c cluster.Cluster) failers.DiskStaller {
+			return failers.NewCGroupDiskStaller(
+				t, c, []failers.BandwidthReadWrite{failers.WriteBandwidth, failers.ReadBandwidth}, true,
+			)
+		},
+		"cgroup/write-only/logs-too=true": func(t test.Test, c cluster.Cluster) failers.DiskStaller {
+			return failers.NewCGroupDiskStaller(
+				t, c, []failers.BandwidthReadWrite{failers.WriteBandwidth}, true,
+			)
 		},
 	}
 
@@ -76,7 +84,7 @@ func registerDiskStalledDetection(r registry.Registry) {
 }
 
 func runDiskStalledDetection(
-	ctx context.Context, t test.Test, c cluster.Cluster, s diskStaller, doStall bool,
+	ctx context.Context, t test.Test, c cluster.Cluster, s failers.DiskStaller, doStall bool,
 ) {
 	startOpts := option.DefaultStartOpts()
 	startOpts.RoachprodOpts.ExtraArgs = []string{
@@ -278,177 +286,4 @@ func getProcessMonotonicTimestamp(
 		return 0, true
 	}
 	return time.Duration(u) * time.Microsecond, true
-}
-
-type diskStaller interface {
-	Setup(ctx context.Context)
-	Cleanup(ctx context.Context)
-	Stall(ctx context.Context, nodes option.NodeListOption)
-	Unstall(ctx context.Context, nodes option.NodeListOption)
-	DataDir() string
-	LogDir() string
-}
-
-type dmsetupDiskStaller struct {
-	t test.Test
-	c cluster.Cluster
-}
-
-var _ diskStaller = (*dmsetupDiskStaller)(nil)
-
-func (s *dmsetupDiskStaller) device() string { return getDevice(s.t, s.c) }
-
-func (s *dmsetupDiskStaller) Setup(ctx context.Context) {
-	dev := s.device()
-	// snapd will run "snapd auto-import /dev/dm-0" via udev triggers when
-	// /dev/dm-0 is created. This possibly interferes with the dmsetup create
-	// reload, so uninstall snapd.
-	s.c.Run(ctx, option.WithNodes(s.c.All()), `sudo apt-get purge -y snapd`)
-	s.c.Run(ctx, option.WithNodes(s.c.All()), `sudo umount -f /mnt/data1 || true`)
-	s.c.Run(ctx, option.WithNodes(s.c.All()), `sudo dmsetup remove_all`)
-	err := s.c.RunE(ctx, option.WithNodes(s.c.All()), `echo "0 $(sudo blockdev --getsz `+dev+`) linear `+dev+` 0" | `+
-		`sudo dmsetup create data1`)
-	if err != nil {
-		// This has occasionally been seen to fail with "Device or resource busy",
-		// with no clear explanation. Try to find out who it is.
-		s.c.Run(ctx, option.WithNodes(s.c.All()), "sudo bash -c 'ps aux; dmsetup status; mount; lsof'")
-		s.t.Fatal(err)
-	}
-	s.c.Run(ctx, option.WithNodes(s.c.All()), `sudo mount /dev/mapper/data1 /mnt/data1`)
-}
-
-func (s *dmsetupDiskStaller) Cleanup(ctx context.Context) {
-	s.c.Run(ctx, option.WithNodes(s.c.All()), `sudo dmsetup resume data1`)
-	s.c.Run(ctx, option.WithNodes(s.c.All()), `sudo umount /mnt/data1`)
-	s.c.Run(ctx, option.WithNodes(s.c.All()), `sudo dmsetup remove_all`)
-	s.c.Run(ctx, option.WithNodes(s.c.All()), `sudo mount /mnt/data1`)
-	// Reinstall snapd in case subsequent tests need it.
-	s.c.Run(ctx, option.WithNodes(s.c.All()), `sudo apt-get install -y snapd`)
-}
-
-func (s *dmsetupDiskStaller) Stall(ctx context.Context, nodes option.NodeListOption) {
-	s.c.Run(ctx, option.WithNodes(nodes), `sudo dmsetup suspend --noflush --nolockfs data1`)
-}
-
-func (s *dmsetupDiskStaller) Unstall(ctx context.Context, nodes option.NodeListOption) {
-	s.c.Run(ctx, option.WithNodes(nodes), `sudo dmsetup resume data1`)
-}
-
-func (s *dmsetupDiskStaller) DataDir() string { return "{store-dir}" }
-func (s *dmsetupDiskStaller) LogDir() string  { return "logs" }
-
-type cgroupDiskStaller struct {
-	t           test.Test
-	c           cluster.Cluster
-	readOrWrite []bandwidthReadWrite
-	logsToo     bool
-}
-
-var _ diskStaller = (*cgroupDiskStaller)(nil)
-
-func (s *cgroupDiskStaller) DataDir() string { return "{store-dir}" }
-func (s *cgroupDiskStaller) LogDir() string {
-	return "logs"
-}
-func (s *cgroupDiskStaller) Setup(ctx context.Context) {
-	if s.logsToo {
-		s.c.Run(ctx, option.WithNodes(s.c.All()), "mkdir -p {store-dir}/logs")
-		s.c.Run(ctx, option.WithNodes(s.c.All()), "rm -f logs && ln -s {store-dir}/logs logs || true")
-	}
-}
-func (s *cgroupDiskStaller) Cleanup(ctx context.Context) {}
-
-func (s *cgroupDiskStaller) Stall(ctx context.Context, nodes option.NodeListOption) {
-	// Shuffle the order of read and write stall initiation.
-	rand.Shuffle(len(s.readOrWrite), func(i, j int) {
-		s.readOrWrite[i], s.readOrWrite[j] = s.readOrWrite[j], s.readOrWrite[i]
-	})
-	for _, rw := range s.readOrWrite {
-		// NB: I don't understand why, but attempting to set a
-		// bytesPerSecond={0,1} results in Invalid argument from the io.max
-		// cgroupv2 API.
-		if err := s.setThroughput(ctx, nodes, rw, throughput{limited: true, bytesPerSecond: 4}); err != nil {
-			s.t.Fatal(err)
-		}
-	}
-}
-
-func (s *cgroupDiskStaller) Unstall(ctx context.Context, nodes option.NodeListOption) {
-	for _, rw := range s.readOrWrite {
-		err := s.setThroughput(ctx, nodes, rw, throughput{limited: false})
-		s.t.L().PrintfCtx(ctx, "error unstalling the disk; stumbling on: %v", err)
-		// NB: We log the error and continue on because unstalling may not
-		// succeed if the process has successfully exited.
-	}
-}
-
-func (s *cgroupDiskStaller) device() (major, minor int) {
-	// TODO(jackson): Programmatically determine the device major,minor numbers.
-	// eg,:
-	//    deviceName := getDevice(s.t, s.c)
-	//    `cat /proc/partitions` and find `deviceName`
-	switch s.c.Cloud() {
-	case spec.GCE:
-		// ls -l /dev/sdb
-		// brw-rw---- 1 root disk 8, 16 Mar 27 22:08 /dev/sdb
-		return 8, 16
-	default:
-		s.t.Fatalf("unsupported cloud %q", s.c.Cloud())
-		return 0, 0
-	}
-}
-
-type throughput struct {
-	limited        bool
-	bytesPerSecond int
-}
-
-type bandwidthReadWrite int8
-
-const (
-	readBandwidth bandwidthReadWrite = iota
-	writeBandwidth
-)
-
-func (rw bandwidthReadWrite) cgroupV2BandwidthProp() string {
-	switch rw {
-	case readBandwidth:
-		return "rbps"
-	case writeBandwidth:
-		return "wbps"
-	default:
-		panic("unreachable")
-	}
-}
-
-func (s *cgroupDiskStaller) setThroughput(
-	ctx context.Context, nodes option.NodeListOption, rw bandwidthReadWrite, bw throughput,
-) error {
-	maj, min := s.device()
-	cockroachIOController := filepath.Join("/sys/fs/cgroup/system.slice", roachtestutil.SystemInterfaceSystemdUnitName()+".service", "io.max")
-
-	bytesPerSecondStr := "max"
-	if bw.limited {
-		bytesPerSecondStr = fmt.Sprintf("%d", bw.bytesPerSecond)
-	}
-	return s.c.RunE(ctx, option.WithNodes(nodes), "sudo", "/bin/bash", "-c", fmt.Sprintf(
-		`'echo %d:%d %s=%s > %s'`,
-		maj,
-		min,
-		rw.cgroupV2BandwidthProp(),
-		bytesPerSecondStr,
-		cockroachIOController,
-	))
-}
-
-func getDevice(t test.Test, c cluster.Cluster) string {
-	switch c.Cloud() {
-	case spec.GCE:
-		return "/dev/sdb"
-	case spec.AWS:
-		return "/dev/nvme1n1"
-	default:
-		t.Fatalf("unsupported cloud %q", c.Cloud())
-		return ""
-	}
 }

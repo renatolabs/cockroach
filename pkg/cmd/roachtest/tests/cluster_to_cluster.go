@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/failers"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
@@ -1682,7 +1683,7 @@ func registerClusterReplicationDisconnect(r registry.Registry) {
 		// failer interface calls (e.g. Setup(), and Ready()), we use the
 		// blakholeFailer struct directly. In other words, in this test, we
 		// shouldn't treat the blackholeFailer as an abstracted api.
-		blackholeFailer := &blackholeFailer{t: rd.t, c: rd.c, input: true, output: true}
+		blackholeFailer := failers.NewBlackholeFailer(rd.t, rd.c, true, true)
 		blackholeFailer.FailPartial(ctx, randomNodePair[0], []int{randomNodePair[1]})
 
 		time.Sleep(disconnectDuration)

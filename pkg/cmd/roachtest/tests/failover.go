@@ -14,20 +14,17 @@ import (
 	"context"
 	gosql "database/sql"
 	"fmt"
-	"math/rand"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/failers"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
-	"github.com/cockroachdb/errors"
-	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 )
 
@@ -127,14 +124,14 @@ func registerFailover(r registry.Registry) {
 			Run:              runFailoverPartialLeaseLiveness,
 		})
 
-		for _, failureMode := range allFailureModes {
+		for _, failureMode := range failers.AllFailureModes {
 			failureMode := failureMode // pin loop variable
 
 			clusterOpts := make([]spec.Option, 0)
 			clusterOpts = append(clusterOpts, spec.CPU(2))
 
 			var postValidation registry.PostValidation
-			if failureMode == failureModeDiskStall {
+			if failureMode == failers.FailureModeDiskStall {
 				// Use PDs in an attempt to work around flakes encountered when using
 				// SSDs. See #97968.
 				clusterOpts = append(clusterOpts, spec.DisableLocalSSD())
@@ -213,16 +210,16 @@ func runFailoverChaos(ctx context.Context, t test.Test, c cluster.Cluster, readO
 
 	m := c.NewMonitor(ctx, c.Range(1, 9))
 
-	failers := []Failer{}
-	for _, failureMode := range allFailureModes {
-		failer := makeFailerWithoutLocalNoop(t, c, m, failureMode, opts, settings, rng)
+	failures := []failers.Failer{}
+	for _, failureMode := range failers.AllFailureModes {
+		failer := failers.MakeFailerWithoutLocalNoop(t, c, m, failureMode, opts, settings, rng)
 		if c.IsLocal() && !failer.CanUseLocal() {
 			t.L().Printf("skipping failure mode %q on local cluster", failureMode)
 			continue
 		}
 		failer.Setup(ctx)
 		defer failer.Cleanup(ctx)
-		failers = append(failers, failer)
+		failures = append(failures, failer)
 	}
 
 	c.Start(ctx, t.L(), opts, settings, c.Range(1, 9))
@@ -296,15 +293,15 @@ func runFailoverChaos(ctx context.Context, t test.Test, c cluster.Cluster, readO
 			// Pick 1 or 2 random nodes and failure modes. Make sure we call Ready()
 			// on both before failing, since we may need to fetch information from the
 			// cluster which won't work if there's an active failure.
-			nodeFailers := map[int]Failer{}
+			nodeFailers := map[int]failers.Failer{}
 			for numNodes := 1 + rng.Intn(2); len(nodeFailers) < numNodes; {
 				var node int
 				for node == 0 || nodeFailers[node] != nil {
 					node = 3 + rng.Intn(7) // n1-n2 are SQL gateways, n10 is workload runner
 				}
-				var failer Failer
+				var failer failers.Failer
 				for failer == nil {
-					failer = failers[rng.Intn(len(failers))]
+					failer = failures[rng.Intn(len(failures))]
 					for _, other := range nodeFailers {
 						if !other.CanRunWith(failer.Mode()) || !failer.CanRunWith(other.Mode()) {
 							failer = nil // failers aren't compatible, pick a different one
@@ -312,9 +309,9 @@ func runFailoverChaos(ctx context.Context, t test.Test, c cluster.Cluster, readO
 						}
 					}
 				}
-				if d, ok := failer.(*deadlockFailer); ok { // randomize deadlockFailer
-					d.numReplicas = 1 + rng.Intn(5)
-					d.onlyLeaseholders = rng.Float64() < 0.5
+				if d, ok := failer.(*failers.DeadlockFailer); ok { // randomize deadlockFailer
+					d.NumReplicas = 1 + rng.Intn(5)
+					d.OnlyLeaseholders = rng.Float64() < 0.5
 				}
 				failer.Ready(ctx, node)
 				nodeFailers[node] = failer
@@ -324,7 +321,7 @@ func runFailoverChaos(ctx context.Context, t test.Test, c cluster.Cluster, readO
 				// If the failer supports partial failures (e.g. partial partitions), do
 				// one with 50% probability against a random node (including SQL
 				// gateways).
-				if partialFailer, ok := failer.(PartialFailer); ok && rng.Float64() < 0.5 {
+				if partialFailer, ok := failer.(failers.PartialFailer); ok && rng.Float64() < 0.5 {
 					var partialPeer int
 					for partialPeer == 0 || partialPeer == node {
 						partialPeer = 1 + rng.Intn(9)
@@ -394,7 +391,7 @@ func runFailoverPartialLeaseGateway(ctx context.Context, t test.Test, c cluster.
 
 	m := c.NewMonitor(ctx, c.Range(1, 7))
 
-	failer := makeFailer(t, c, m, failureModeBlackhole, opts, settings, rng).(PartialFailer)
+	failer := failers.MakeFailer(t, c, m, failers.FailureModeBlackhole, opts, settings, rng).(failers.PartialFailer)
 	failer.Setup(ctx)
 	defer failer.Cleanup(ctx)
 
@@ -530,7 +527,7 @@ func runFailoverPartialLeaseLeader(ctx context.Context, t test.Test, c cluster.C
 
 	m := c.NewMonitor(ctx, c.Range(1, 6))
 
-	failer := makeFailer(t, c, m, failureModeBlackhole, opts, settings, rng).(PartialFailer)
+	failer := failers.MakeFailer(t, c, m, failers.FailureModeBlackhole, opts, settings, rng).(failers.PartialFailer)
 	failer.Setup(ctx)
 	defer failer.Cleanup(ctx)
 
@@ -661,7 +658,7 @@ func runFailoverPartialLeaseLiveness(ctx context.Context, t test.Test, c cluster
 
 	m := c.NewMonitor(ctx, c.Range(1, 7))
 
-	failer := makeFailer(t, c, m, failureModeBlackhole, opts, settings, rng).(PartialFailer)
+	failer := failers.MakeFailer(t, c, m, failers.FailureModeBlackhole, opts, settings, rng).(failers.PartialFailer)
 	failer.Setup(ctx)
 	defer failer.Cleanup(ctx)
 
@@ -764,7 +761,7 @@ func runFailoverPartialLeaseLiveness(ctx context.Context, t test.Test, c cluster
 // The test runs a kv50 workload via gateways on n1-n3, measuring the pMax
 // latency for graphing.
 func runFailoverNonSystem(
-	ctx context.Context, t test.Test, c cluster.Cluster, failureMode failureMode,
+	ctx context.Context, t test.Test, c cluster.Cluster, failureMode failers.FailureMode,
 ) {
 	require.Equal(t, 7, c.Spec().NodeCount)
 
@@ -779,7 +776,7 @@ func runFailoverNonSystem(
 
 	m := c.NewMonitor(ctx, c.Range(1, 6))
 
-	failer := makeFailer(t, c, m, failureMode, opts, settings, rng)
+	failer := failers.MakeFailer(t, c, m, failureMode, opts, settings, rng)
 	failer.Setup(ctx)
 	defer failer.Cleanup(ctx)
 
@@ -873,7 +870,7 @@ func runFailoverNonSystem(
 // The test runs a kv50 workload via gateways on n1-n3, measuring the pMax
 // latency for graphing.
 func runFailoverLiveness(
-	ctx context.Context, t test.Test, c cluster.Cluster, failureMode failureMode,
+	ctx context.Context, t test.Test, c cluster.Cluster, failureMode failers.FailureMode,
 ) {
 	require.Equal(t, 5, c.Spec().NodeCount)
 
@@ -888,7 +885,7 @@ func runFailoverLiveness(
 
 	m := c.NewMonitor(ctx, c.Range(1, 4))
 
-	failer := makeFailer(t, c, m, failureMode, opts, settings, rng)
+	failer := failers.MakeFailer(t, c, m, failureMode, opts, settings, rng)
 	failer.Setup(ctx)
 	defer failer.Cleanup(ctx)
 
@@ -988,7 +985,7 @@ func runFailoverLiveness(
 // The test runs a kv50 workload via gateways on n1-n3, measuring the pMax
 // latency for graphing.
 func runFailoverSystemNonLiveness(
-	ctx context.Context, t test.Test, c cluster.Cluster, failureMode failureMode,
+	ctx context.Context, t test.Test, c cluster.Cluster, failureMode failers.FailureMode,
 ) {
 	require.Equal(t, 7, c.Spec().NodeCount)
 
@@ -1003,7 +1000,7 @@ func runFailoverSystemNonLiveness(
 
 	m := c.NewMonitor(ctx, c.Range(1, 6))
 
-	failer := makeFailer(t, c, m, failureMode, opts, settings, rng)
+	failer := failers.MakeFailer(t, c, m, failureMode, opts, settings, rng)
 	failer.Setup(ctx)
 	defer failer.Cleanup(ctx)
 
@@ -1083,524 +1080,6 @@ func runFailoverSystemNonLiveness(
 		return nil
 	})
 	m.Wait()
-}
-
-// failureMode specifies a failure mode.
-type failureMode string
-
-const (
-	failureModeBlackhole     failureMode = "blackhole"
-	failureModeBlackholeRecv failureMode = "blackhole-recv"
-	failureModeBlackholeSend failureMode = "blackhole-send"
-	failureModeCrash         failureMode = "crash"
-	failureModeDeadlock      failureMode = "deadlock"
-	failureModeDiskStall     failureMode = "disk-stall"
-	failureModePause         failureMode = "pause"
-	failureModeNoop          failureMode = "noop"
-)
-
-var allFailureModes = []failureMode{
-	failureModeBlackhole,
-	failureModeBlackholeRecv,
-	failureModeBlackholeSend,
-	failureModeCrash,
-	failureModeDeadlock,
-	failureModeDiskStall,
-	failureModePause,
-	// failureModeNoop intentionally omitted
-}
-
-// makeFailer creates a new failer for the given failureMode. It may return a
-// noopFailer on local clusters.
-func makeFailer(
-	t test.Test,
-	c cluster.Cluster,
-	m cluster.Monitor,
-	failureMode failureMode,
-	opts option.StartOpts,
-	settings install.ClusterSettings,
-	rng *rand.Rand,
-) Failer {
-	f := makeFailerWithoutLocalNoop(t, c, m, failureMode, opts, settings, rng)
-	if c.IsLocal() && !f.CanUseLocal() {
-		t.L().Printf(
-			`failure mode %q not supported on local clusters, using "noop" failure mode instead`,
-			failureMode)
-		f = &noopFailer{}
-	}
-	return f
-}
-
-func makeFailerWithoutLocalNoop(
-	t test.Test,
-	c cluster.Cluster,
-	m cluster.Monitor,
-	failureMode failureMode,
-	opts option.StartOpts,
-	settings install.ClusterSettings,
-	rng *rand.Rand,
-) Failer {
-	switch failureMode {
-	case failureModeBlackhole:
-		return &blackholeFailer{
-			t:      t,
-			c:      c,
-			input:  true,
-			output: true,
-		}
-	case failureModeBlackholeRecv:
-		return &blackholeFailer{
-			t:     t,
-			c:     c,
-			input: true,
-		}
-	case failureModeBlackholeSend:
-		return &blackholeFailer{
-			t:      t,
-			c:      c,
-			output: true,
-		}
-	case failureModeCrash:
-		return &crashFailer{
-			t:             t,
-			c:             c,
-			m:             m,
-			startOpts:     opts,
-			startSettings: settings,
-		}
-	case failureModeDeadlock:
-		return &deadlockFailer{
-			t:                t,
-			c:                c,
-			m:                m,
-			rng:              rng,
-			startOpts:        opts,
-			startSettings:    settings,
-			onlyLeaseholders: true,
-			numReplicas:      5,
-		}
-	case failureModeDiskStall:
-		return &diskStallFailer{
-			t:             t,
-			c:             c,
-			m:             m,
-			startOpts:     opts,
-			startSettings: settings,
-			staller:       &dmsetupDiskStaller{t: t, c: c},
-		}
-	case failureModePause:
-		return &pauseFailer{
-			t: t,
-			c: c,
-		}
-	case failureModeNoop:
-		return &noopFailer{}
-	default:
-		t.Fatalf("unknown failure mode %s", failureMode)
-		return nil
-	}
-}
-
-// Failer fails and recovers a given node in some particular way.
-type Failer interface {
-	fmt.Stringer
-
-	// Mode returns the failure mode of the failer.
-	Mode() failureMode
-
-	// CanUseLocal returns true if the failer can be run with a local cluster.
-	CanUseLocal() bool
-
-	// CanRunWith returns true if the failer can run concurrently with another
-	// given failure mode on a different cluster node. It is not required to
-	// commute, i.e. A may not be able to run with B even though B can run with A.
-	CanRunWith(other failureMode) bool
-
-	// Setup prepares the failer. It is called before the cluster is started.
-	Setup(ctx context.Context)
-
-	// Cleanup cleans up when the test exits. This is needed e.g. when the cluster
-	// is reused by a different test.
-	Cleanup(ctx context.Context)
-
-	// Ready is called before failing each node, when the cluster and workload is
-	// running and after recovering the previous node failure if any.
-	Ready(ctx context.Context, nodeID int)
-
-	// Fail fails the given node.
-	Fail(ctx context.Context, nodeID int)
-
-	// Recover recovers the given node.
-	Recover(ctx context.Context, nodeID int)
-}
-
-// PartialFailer supports partial failures between specific node pairs.
-type PartialFailer interface {
-	Failer
-
-	// FailPartial fails the node for the given peers.
-	FailPartial(ctx context.Context, nodeID int, peerIDs []int)
-}
-
-// noopFailer doesn't do anything.
-type noopFailer struct{}
-
-func (f *noopFailer) Mode() failureMode                       { return failureModeNoop }
-func (f *noopFailer) String() string                          { return string(f.Mode()) }
-func (f *noopFailer) CanUseLocal() bool                       { return true }
-func (f *noopFailer) CanRunWith(failureMode) bool             { return true }
-func (f *noopFailer) Setup(context.Context)                   {}
-func (f *noopFailer) Ready(context.Context, int)              {}
-func (f *noopFailer) Cleanup(context.Context)                 {}
-func (f *noopFailer) Fail(context.Context, int)               {}
-func (f *noopFailer) FailPartial(context.Context, int, []int) {}
-func (f *noopFailer) Recover(context.Context, int)            {}
-
-// blackholeFailer causes a network failure where TCP/IP packets to/from port
-// 26257 are dropped, causing network hangs and timeouts.
-//
-// If only one if input or output are enabled, connections in that direction
-// will fail (even already established connections), but connections in the
-// other direction are still functional (including responses).
-type blackholeFailer struct {
-	t      test.Test
-	c      cluster.Cluster
-	input  bool
-	output bool
-}
-
-func (f *blackholeFailer) Mode() failureMode {
-	if f.input && !f.output {
-		return failureModeBlackholeRecv
-	} else if f.output && !f.input {
-		return failureModeBlackholeSend
-	}
-	return failureModeBlackhole
-}
-
-func (f *blackholeFailer) String() string              { return string(f.Mode()) }
-func (f *blackholeFailer) CanUseLocal() bool           { return false } // needs iptables
-func (f *blackholeFailer) CanRunWith(failureMode) bool { return true }
-func (f *blackholeFailer) Setup(context.Context)       {}
-func (f *blackholeFailer) Ready(context.Context, int)  {}
-
-func (f *blackholeFailer) Cleanup(ctx context.Context) {
-	f.c.Run(ctx, option.WithNodes(f.c.All()), `sudo iptables -F`)
-}
-
-func (f *blackholeFailer) Fail(ctx context.Context, nodeID int) {
-	pgport := fmt.Sprintf("{pgport:%d}", nodeID)
-
-	// When dropping both input and output, make sure we drop packets in both
-	// directions for both the inbound and outbound TCP connections, such that we
-	// get a proper black hole. Only dropping one direction for both of INPUT and
-	// OUTPUT will still let e.g. TCP retransmits through, which may affect the
-	// TCP stack behavior and is not representative of real network outages.
-	//
-	// For the asymmetric partitions, only drop packets in one direction since
-	// this is representative of accidental firewall rules we've seen cause such
-	// outages in the wild.
-	if f.input && f.output {
-		// Inbound TCP connections, both received and sent packets.
-		f.c.Run(ctx, option.WithNodes(f.c.Node(nodeID)), fmt.Sprintf(`sudo iptables -A INPUT -p tcp --dport %s -j DROP`, pgport))
-		f.c.Run(ctx, option.WithNodes(f.c.Node(nodeID)), fmt.Sprintf(`sudo iptables -A OUTPUT -p tcp --sport %s -j DROP`, pgport))
-		// Outbound TCP connections, both sent and received packets.
-		f.c.Run(ctx, option.WithNodes(f.c.Node(nodeID)), fmt.Sprintf(`sudo iptables -A OUTPUT -p tcp --dport %s -j DROP`, pgport))
-		f.c.Run(ctx, option.WithNodes(f.c.Node(nodeID)), fmt.Sprintf(`sudo iptables -A INPUT -p tcp --sport %s -j DROP`, pgport))
-	} else if f.input {
-		f.c.Run(ctx, option.WithNodes(f.c.Node(nodeID)), fmt.Sprintf(`sudo iptables -A INPUT -p tcp --dport %s -j DROP`, pgport))
-	} else if f.output {
-		f.c.Run(ctx, option.WithNodes(f.c.Node(nodeID)), fmt.Sprintf(`sudo iptables -A OUTPUT -p tcp --dport %s -j DROP`, pgport))
-	}
-}
-
-// FailPartial creates a partial blackhole failure between the given node and
-// peers.
-func (f *blackholeFailer) FailPartial(ctx context.Context, nodeID int, peerIDs []int) {
-	peerIPs, err := f.c.InternalIP(ctx, f.t.L(), peerIDs)
-	require.NoError(f.t, err)
-
-	for _, peerIP := range peerIPs {
-		pgport := fmt.Sprintf("{pgport:%d}", nodeID)
-
-		// When dropping both input and output, make sure we drop packets in both
-		// directions for both the inbound and outbound TCP connections, such that
-		// we get a proper black hole. Only dropping one direction for both of INPUT
-		// and OUTPUT will still let e.g. TCP retransmits through, which may affect
-		// TCP stack behavior and is not representative of real network outages.
-		//
-		// For the asymmetric partitions, only drop packets in one direction since
-		// this is representative of accidental firewall rules we've seen cause such
-		// outages in the wild.
-		if f.input && f.output {
-			// Inbound TCP connections, both received and sent packets.
-			f.c.Run(ctx, option.WithNodes(f.c.Node(nodeID)), fmt.Sprintf(
-				`sudo iptables -A INPUT -p tcp -s %s --dport %s -j DROP`, peerIP, pgport))
-			f.c.Run(ctx, option.WithNodes(f.c.Node(nodeID)), fmt.Sprintf(
-				`sudo iptables -A OUTPUT -p tcp -d %s --sport %s -j DROP`, peerIP, pgport))
-			// Outbound TCP connections, both sent and received packets.
-			f.c.Run(ctx, option.WithNodes(f.c.Node(nodeID)), fmt.Sprintf(
-				`sudo iptables -A OUTPUT -p tcp -d %s --dport %s -j DROP`, peerIP, pgport))
-			f.c.Run(ctx, option.WithNodes(f.c.Node(nodeID)), fmt.Sprintf(
-				`sudo iptables -A INPUT -p tcp -s %s --sport %s -j DROP`, peerIP, pgport))
-		} else if f.input {
-			f.c.Run(ctx, option.WithNodes(f.c.Node(nodeID)), fmt.Sprintf(
-				`sudo iptables -A INPUT -p tcp -s %s --dport %s -j DROP`, peerIP, pgport))
-		} else if f.output {
-			f.c.Run(ctx, option.WithNodes(f.c.Node(nodeID)), fmt.Sprintf(
-				`sudo iptables -A OUTPUT -p tcp -d %s --dport %s -j DROP`, peerIP, pgport))
-		}
-	}
-}
-
-func (f *blackholeFailer) Recover(ctx context.Context, nodeID int) {
-	f.c.Run(ctx, option.WithNodes(f.c.Node(nodeID)), `sudo iptables -F`)
-}
-
-// crashFailer is a process crash where the TCP/IP stack remains responsive
-// and sends immediate RST packets to peers.
-type crashFailer struct {
-	t             test.Test
-	c             cluster.Cluster
-	m             cluster.Monitor
-	startOpts     option.StartOpts
-	startSettings install.ClusterSettings
-}
-
-func (f *crashFailer) Mode() failureMode           { return failureModeCrash }
-func (f *crashFailer) String() string              { return string(f.Mode()) }
-func (f *crashFailer) CanUseLocal() bool           { return true }
-func (f *crashFailer) CanRunWith(failureMode) bool { return true }
-func (f *crashFailer) Setup(context.Context)       {}
-func (f *crashFailer) Ready(context.Context, int)  {}
-func (f *crashFailer) Cleanup(context.Context)     {}
-
-func (f *crashFailer) Fail(ctx context.Context, nodeID int) {
-	f.m.ExpectDeath()
-	f.c.Stop(ctx, f.t.L(), option.DefaultStopOpts(), f.c.Node(nodeID)) // uses SIGKILL
-}
-
-func (f *crashFailer) Recover(ctx context.Context, nodeID int) {
-	f.c.Start(ctx, f.t.L(), f.startOpts, f.startSettings, f.c.Node(nodeID))
-}
-
-// deadlockFailer deadlocks replicas. In addition to deadlocks, this failure
-// mode is representative of all failure modes that leave a replica unresponsive
-// while the node is otherwise still functional.
-type deadlockFailer struct {
-	t                test.Test
-	c                cluster.Cluster
-	m                cluster.Monitor
-	rng              *rand.Rand
-	startOpts        option.StartOpts
-	startSettings    install.ClusterSettings
-	onlyLeaseholders bool
-	numReplicas      int
-
-	locks  map[int][]roachpb.RangeID // track locks by node
-	ranges map[int][]roachpb.RangeID // ranges present on nodes
-	leases map[int][]roachpb.RangeID // range leases present on nodes
-}
-
-func (f *deadlockFailer) Mode() failureMode             { return failureModeDeadlock }
-func (f *deadlockFailer) String() string                { return string(f.Mode()) }
-func (f *deadlockFailer) CanUseLocal() bool             { return true }
-func (f *deadlockFailer) CanRunWith(m failureMode) bool { return true }
-func (f *deadlockFailer) Setup(context.Context)         {}
-func (f *deadlockFailer) Cleanup(context.Context)       {}
-
-func (f *deadlockFailer) Ready(ctx context.Context, nodeID int) {
-	// In chaos tests, other nodes will be failing concurrently. We therefore
-	// can't run SHOW CLUSTER RANGES WITH DETAILS in Fail(), since it needs to
-	// read from all ranges. Instead, we fetch a snapshot of replicas and leases
-	// now, and if any replicas should move we'll skip them later.
-	//
-	// We also have to ensure we have an active connection to the node in the
-	// pool, since we may be unable to create one during concurrent failures.
-	conn := f.c.Conn(ctx, f.t.L(), nodeID)
-	rows, err := conn.QueryContext(ctx,
-		`SELECT range_id, replicas, lease_holder FROM [SHOW CLUSTER RANGES WITH DETAILS]`)
-	require.NoError(f.t, err)
-
-	f.ranges = map[int][]roachpb.RangeID{}
-	f.leases = map[int][]roachpb.RangeID{}
-	for rows.Next() {
-		var rangeID roachpb.RangeID
-		var replicas []int64
-		var leaseHolder int
-		require.NoError(f.t, rows.Scan(&rangeID, (*pq.Int64Array)(&replicas), &leaseHolder))
-		f.leases[leaseHolder] = append(f.leases[leaseHolder], rangeID)
-		for _, nodeID := range replicas {
-			f.ranges[int(nodeID)] = append(f.ranges[int(nodeID)], rangeID)
-		}
-	}
-	require.NoError(f.t, rows.Err())
-}
-
-func (f *deadlockFailer) Fail(ctx context.Context, nodeID int) {
-	require.NotZero(f.t, f.numReplicas)
-	if f.locks == nil {
-		f.locks = map[int][]roachpb.RangeID{}
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, 20*time.Second) // can take a while to lock
-	defer cancel()
-
-	var ranges []roachpb.RangeID
-	if f.onlyLeaseholders {
-		ranges = append(ranges, f.leases[nodeID]...)
-	} else {
-		ranges = append(ranges, f.ranges[nodeID]...)
-	}
-	f.rng.Shuffle(len(ranges), func(i, j int) {
-		ranges[i], ranges[j] = ranges[j], ranges[i]
-	})
-
-	conn := f.c.Conn(ctx, f.t.L(), nodeID)
-
-	for i := 0; i < len(ranges) && len(f.locks[nodeID]) < f.numReplicas; i++ {
-		rangeID := ranges[i]
-		var locked bool
-		require.NoError(f.t, conn.QueryRowContext(ctx,
-			`SELECT crdb_internal.unsafe_lock_replica($1::int, true)`, rangeID).Scan(&locked))
-		if locked {
-			f.locks[nodeID] = append(f.locks[nodeID], rangeID)
-			f.t.L().Printf("locked r%d on n%d", rangeID, nodeID)
-		}
-	}
-	// Some nodes may have fewer ranges than the requested numReplicas locks, and
-	// replicas may also have moved in the meanwhile. Just assert that we were able
-	// to lock at least 1 replica.
-	require.NotEmpty(f.t, f.locks[nodeID], "didn't lock any replicas")
-}
-
-func (f *deadlockFailer) Recover(ctx context.Context, nodeID int) {
-	if f.locks == nil || len(f.locks[nodeID]) == 0 {
-		return
-	}
-
-	err := func() error {
-		ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		defer cancel()
-
-		conn, err := f.c.ConnE(ctx, f.t.L(), nodeID)
-		if err != nil {
-			return err
-		}
-		for _, rangeID := range f.locks[nodeID] {
-			var unlocked bool
-			err := conn.QueryRowContext(ctx,
-				`SELECT crdb_internal.unsafe_lock_replica($1, false)`, rangeID).Scan(&unlocked)
-			if err != nil {
-				return err
-			} else if !unlocked {
-				return errors.Errorf("r%d was not unlocked", rangeID)
-			} else {
-				f.t.L().Printf("unlocked r%d on n%d", rangeID, nodeID)
-			}
-		}
-		return nil
-	}()
-	// We may have locked replicas that prevent us from connecting to the node
-	// again, so we fall back to restarting the node.
-	if err != nil {
-		f.t.L().Printf("failed to unlock replicas on n%d, restarting node: %s", nodeID, err)
-		f.m.ExpectDeath()
-		f.c.Stop(ctx, f.t.L(), option.DefaultStopOpts(), f.c.Node(nodeID))
-		f.c.Start(ctx, f.t.L(), f.startOpts, f.startSettings, f.c.Node(nodeID))
-	}
-	delete(f.locks, nodeID)
-}
-
-// diskStallFailer stalls the disk indefinitely. This should cause the node to
-// eventually self-terminate, but we'd want leases to move off before then.
-type diskStallFailer struct {
-	t             test.Test
-	c             cluster.Cluster
-	m             cluster.Monitor
-	startOpts     option.StartOpts
-	startSettings install.ClusterSettings
-	staller       diskStaller
-}
-
-func (f *diskStallFailer) Mode() failureMode           { return failureModeDiskStall }
-func (f *diskStallFailer) String() string              { return string(f.Mode()) }
-func (f *diskStallFailer) CanUseLocal() bool           { return false } // needs dmsetup
-func (f *diskStallFailer) CanRunWith(failureMode) bool { return true }
-
-func (f *diskStallFailer) Setup(ctx context.Context) {
-	f.staller.Setup(ctx)
-}
-
-func (f *diskStallFailer) Cleanup(ctx context.Context) {
-	f.staller.Unstall(ctx, f.c.All())
-	// We have to stop the cluster before cleaning up the staller.
-	f.m.ExpectDeaths(int32(f.c.Spec().NodeCount))
-	f.c.Stop(ctx, f.t.L(), option.DefaultStopOpts(), f.c.All())
-	f.staller.Cleanup(ctx)
-}
-
-func (f *diskStallFailer) Ready(ctx context.Context, nodeID int) {
-	// Other failure modes may have disabled the disk stall detector (see
-	// pauseFailer), so we explicitly enable it.
-	conn := f.c.Conn(ctx, f.t.L(), nodeID)
-	_, err := conn.ExecContext(ctx,
-		`SET CLUSTER SETTING storage.max_sync_duration.fatal.enabled = true`)
-	require.NoError(f.t, err)
-}
-
-func (f *diskStallFailer) Fail(ctx context.Context, nodeID int) {
-	// Pebble's disk stall detector should crash the node.
-	f.m.ExpectDeath()
-	f.staller.Stall(ctx, f.c.Node(nodeID))
-}
-
-func (f *diskStallFailer) Recover(ctx context.Context, nodeID int) {
-	f.staller.Unstall(ctx, f.c.Node(nodeID))
-	// Pebble's disk stall detector should have terminated the node, but in case
-	// it didn't, we explicitly stop it first.
-	f.c.Stop(ctx, f.t.L(), option.DefaultStopOpts(), f.c.Node(nodeID))
-	f.c.Start(ctx, f.t.L(), f.startOpts, f.startSettings, f.c.Node(nodeID))
-}
-
-// pauseFailer pauses the process, but keeps the OS (and thus network
-// connections) alive.
-type pauseFailer struct {
-	t test.Test
-	c cluster.Cluster
-}
-
-func (f *pauseFailer) Mode() failureMode       { return failureModePause }
-func (f *pauseFailer) String() string          { return string(f.Mode()) }
-func (f *pauseFailer) CanUseLocal() bool       { return true }
-func (f *pauseFailer) Setup(context.Context)   {}
-func (f *pauseFailer) Cleanup(context.Context) {}
-
-func (f *pauseFailer) CanRunWith(other failureMode) bool {
-	// Since we disable the disk stall detector, we can't run concurrently with
-	// a disk stall on a different node.
-	return other != failureModeDiskStall
-}
-
-func (f *pauseFailer) Ready(ctx context.Context, nodeID int) {
-	// The process pause can trip the disk stall detector, so we disable it. We
-	// could let it fire, but we'd like to see if the node can recover from the
-	// pause and keep working. It will be re-enabled by diskStallFailer.Ready().
-	conn := f.c.Conn(ctx, f.t.L(), nodeID)
-	_, err := conn.ExecContext(ctx,
-		`SET CLUSTER SETTING storage.max_sync_duration.fatal.enabled = false`)
-	require.NoError(f.t, err)
-}
-
-func (f *pauseFailer) Fail(ctx context.Context, nodeID int) {
-	f.c.Signal(ctx, f.t.L(), 19, f.c.Node(nodeID)) // SIGSTOP
-}
-
-func (f *pauseFailer) Recover(ctx context.Context, nodeID int) {
-	f.c.Signal(ctx, f.t.L(), 18, f.c.Node(nodeID)) // SIGCONT
-	// NB: We don't re-enable the disk stall detector here, but instead rely on
-	// diskStallFailer.Ready to ensure it's enabled, since the cluster likely
-	// hasn't recovered yet and we may fail to set the cluster setting.
 }
 
 // waitForUpreplication waits for upreplication of ranges that satisfy the
