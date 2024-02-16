@@ -38,7 +38,7 @@ const maxSyncDur = 10 * time.Second
 func registerDiskStalledDetection(r registry.Registry) {
 	stallers := map[string]func(test.Test, cluster.Cluster) failers.DiskStaller{
 		"dmsetup": func(t test.Test, c cluster.Cluster) failers.DiskStaller {
-			return failers.NewDMSetupDiskStaller(t, c)
+			return failers.NewDMSetupDiskStaller(c, t.L())
 		},
 		"cgroup/read-write/logs-too=false": func(t test.Test, c cluster.Cluster) failers.DiskStaller {
 			return failers.NewCGroupDiskStaller(
@@ -98,7 +98,7 @@ func runDiskStalledDetection(
 		fmt.Sprintf("COCKROACH_ENGINE_MAX_SYNC_DURATION_DEFAULT=%s", maxSyncDur))
 
 	t.Status("setting up disk staller")
-	s.Setup(ctx)
+	_ = s.Setup(ctx)
 	defer s.Cleanup(ctx)
 
 	t.Status("starting cluster")
@@ -172,7 +172,7 @@ func runDiskStalledDetection(
 	if doStall {
 		m.ExpectDeath()
 	}
-	s.Stall(ctx, c.Node(1))
+	_ = s.Stall(ctx, c.Node(1))
 	// NB: We use a background context in the defer'ed unstall command,
 	// otherwise on test failure our c.Run calls will be ignored. Leaving
 	// the disk stalled will prevent artifact collection, making debugging

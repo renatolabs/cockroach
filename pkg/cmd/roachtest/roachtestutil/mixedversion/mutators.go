@@ -10,7 +10,17 @@
 
 package mixedversion
 
-import "math/rand"
+import (
+	"context"
+	"fmt"
+	"math/rand"
+	"time"
+
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/failers"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
+)
 
 const (
 	// PreserveDowngradeOptionRandomizer is a mutator that changes the
@@ -119,4 +129,183 @@ func randomUpgrades(rng *rand.Rand, plan *TestPlan) []stepSelector {
 	}
 
 	return selectors
+}
+
+const FaultInjectorMutator = "fault_injector"
+
+type faultInjectorMutator struct{}
+
+func (m faultInjectorMutator) Name() string {
+	return FaultInjectorMutator
+}
+
+// Most runs will have this mutator disabled, as the base upgrade
+// plan's approach of resetting the cluster setting when all nodes are
+// upgraded is the most sensible / common.
+func (m faultInjectorMutator) Probability() float64 {
+	return 1 // TODO: testing
+}
+
+// Generate returns mutations to remove the existing step to reset the
+// `preserve_downgrade_option` cluster setting, and reinserts it back
+// in some other point in the test, before all nodes are upgraded. Not
+// every upgrade in the test plan is affected, but the upgrade to the
+// current version is always mutated.
+func (m faultInjectorMutator) Generate(rng *rand.Rand, plan *TestPlan) []mutation {
+	var mutations []mutation
+	setupFailers := make(map[failers.FailureMode]struct{})
+	for _, upgradeSelector := range randomUpgrades(rng, plan) {
+		duringMigrationsProbability := 0.9
+		failDuringMigrations := rng.Float64() < duringMigrationsProbability
+		failureCount := 1
+		if failDuringMigrations {
+			failureCount = 5
+		}
+		mode, setupStep, runStep := newFaultInjectionStep(rng, failureCount)
+
+		var insertSetupStep []mutation
+		if _, seen := setupFailers[mode]; !seen {
+			insertSetupStep = plan.newStepSelector().
+				Filter(func(s *singleStep) bool {
+					return s.context.Stage == OnStartupStage
+				}).
+				RandomStep(rng).
+				Insert(rng, setupStep)
+
+			setupFailers[mode] = struct{}{}
+		}
+
+		mutations = append(mutations, insertSetupStep...)
+
+		var insertRunStep []mutation
+		if failDuringMigrations {
+			insertRunStep = upgradeSelector.
+				Filter(func(s *singleStep) bool {
+					return s.context.Stage == RunningUpgradeMigrationsStage
+				}).
+				RandomStep(rng).
+				InsertBefore(runStep)
+
+			mutations = append(mutations, insertRunStep...)
+		} else {
+			insertRunStep = upgradeSelector.
+				Filter(func(s *singleStep) bool {
+					return s.context.Stage != RunningUpgradeMigrationsStage
+				}).
+				RandomStep(rng).
+				InsertSequential(rng, runStep)
+
+			mutations = append(mutations, insertRunStep...)
+		}
+	}
+
+	return mutations
+}
+
+func newFaultInjectionStep(
+	rng *rand.Rand, count int,
+) (failers.FailureMode, singleStepProtocol, singleStepProtocol) {
+	allFailures := []failers.FailureMode{
+		failers.FailureModeBlackholeRecv,
+		failers.FailureModeBlackholeSend,
+		failers.FailureModeDiskStall,
+		failers.FailureModePause,
+	}
+	mode := allFailures[rng.Intn(len(allFailures))]
+
+	possibleDurations := []time.Duration{
+		10 * time.Second, 1 * time.Minute, 5 * time.Minute,
+	}
+	if mode == failers.FailureModeDiskStall {
+		possibleDurations = []time.Duration{5 * time.Second, 10 * time.Second}
+	}
+
+	duration := possibleDurations[rng.Intn(len(possibleDurations))]
+
+	setupStep := setupFaultInjectorStep{mode: mode}
+	runStep := runFaultInjectorStep{mode: mode, duration: duration, count: count}
+
+	return mode, setupStep, runStep
+}
+
+type setupFaultInjectorStep struct {
+	mode failers.FailureMode
+}
+
+func (s setupFaultInjectorStep) Description() string {
+	return fmt.Sprintf("set up fault injector %q", s.mode)
+}
+
+func (s setupFaultInjectorStep) Background() shouldStop { return nil }
+
+func (s setupFaultInjectorStep) Run(
+	ctx context.Context, l *logger.Logger, rng *rand.Rand, h *Helper,
+) error {
+	l.Printf("set up fault injector %s", s.mode)
+	failer := failers.MakeFailer(
+		// No test.Test: intentional; should be returning error.
+		nil, h.runner.cluster, l, nil, s.mode, option.DefaultStartOpts(), install.ClusterSettings{}, rng,
+	)
+	return failer.Setup(ctx)
+}
+
+type runFaultInjectorStep struct {
+	mode     failers.FailureMode
+	duration time.Duration
+	count    int
+}
+
+func (s runFaultInjectorStep) Description() string {
+	var timesStr string
+	if s.count > 1 {
+		timesStr = fmt.Sprintf(" a total of %d times", s.count)
+	}
+	return fmt.Sprintf(
+		"apply fault injector %q on some node for %s%s",
+		s.mode, s.duration, timesStr,
+	)
+}
+
+func (s runFaultInjectorStep) Background() shouldStop { return nil }
+
+func (s runFaultInjectorStep) Run(
+	ctx context.Context, l *logger.Logger, rng *rand.Rand, h *Helper,
+) error {
+	delayBetweenFails := 2 * time.Minute
+	failer := failers.MakeFailer(
+		// No test.Test: intentional; should be returning error.
+		nil, h.runner.cluster, l, nil, s.mode, option.DefaultStartOpts(), install.ClusterSettings{}, rng,
+	)
+
+	runFailer := func() error {
+		target := h.RandomNode(rng, h.Context.CockroachNodes)
+		l.Printf("running fault injection %s on n%d for %s", s.mode, target, s.duration)
+
+		if err := failer.Fail(ctx, target); err != nil {
+			return err
+		}
+
+		defer failer.Recover(ctx, target)
+
+		select {
+		case <-time.After(s.duration):
+		case <-ctx.Done():
+		}
+
+		return nil
+	}
+
+	for j := 0; j < s.count; j++ {
+		if err := runFailer(); err != nil {
+			return err
+		}
+
+		l.Printf("waiting for %s", delayBetweenFails)
+		select {
+		case <-time.After(delayBetweenFails):
+		case <-ctx.Done():
+		}
+	}
+
+	return nil
 }

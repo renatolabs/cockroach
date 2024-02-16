@@ -212,12 +212,12 @@ func runFailoverChaos(ctx context.Context, t test.Test, c cluster.Cluster, readO
 
 	failures := []failers.Failer{}
 	for _, failureMode := range failers.AllFailureModes {
-		failer := failers.MakeFailerWithoutLocalNoop(t, c, m, failureMode, opts, settings, rng)
+		failer := failers.MakeFailerWithoutLocalNoop(t, c, t.L(), m, failureMode, opts, settings, rng)
 		if c.IsLocal() && !failer.CanUseLocal() {
 			t.L().Printf("skipping failure mode %q on local cluster", failureMode)
 			continue
 		}
-		failer.Setup(ctx)
+		_ = failer.Setup(ctx)
 		defer failer.Cleanup(ctx)
 		failures = append(failures, failer)
 	}
@@ -330,7 +330,7 @@ func runFailoverChaos(ctx context.Context, t test.Test, c cluster.Cluster, readO
 					partialFailer.FailPartial(ctx, node, []int{partialPeer})
 				} else {
 					t.L().Printf("failing n%d (%s)", node, failer)
-					failer.Fail(ctx, node)
+					_ = failer.Fail(ctx, node)
 				}
 			}
 
@@ -391,8 +391,8 @@ func runFailoverPartialLeaseGateway(ctx context.Context, t test.Test, c cluster.
 
 	m := c.NewMonitor(ctx, c.Range(1, 7))
 
-	failer := failers.MakeFailer(t, c, m, failers.FailureModeBlackhole, opts, settings, rng).(failers.PartialFailer)
-	failer.Setup(ctx)
+	failer := failers.MakeFailer(t, c, t.L(), m, failers.FailureModeBlackhole, opts, settings, rng).(failers.PartialFailer)
+	_ = failer.Setup(ctx)
 	defer failer.Cleanup(ctx)
 
 	c.Start(ctx, t.L(), opts, settings, c.Range(1, 7))
@@ -527,8 +527,8 @@ func runFailoverPartialLeaseLeader(ctx context.Context, t test.Test, c cluster.C
 
 	m := c.NewMonitor(ctx, c.Range(1, 6))
 
-	failer := failers.MakeFailer(t, c, m, failers.FailureModeBlackhole, opts, settings, rng).(failers.PartialFailer)
-	failer.Setup(ctx)
+	failer := failers.MakeFailer(t, c, t.L(), m, failers.FailureModeBlackhole, opts, settings, rng).(failers.PartialFailer)
+	_ = failer.Setup(ctx)
 	defer failer.Cleanup(ctx)
 
 	c.Start(ctx, t.L(), opts, settings, c.Range(1, 3))
@@ -658,8 +658,8 @@ func runFailoverPartialLeaseLiveness(ctx context.Context, t test.Test, c cluster
 
 	m := c.NewMonitor(ctx, c.Range(1, 7))
 
-	failer := failers.MakeFailer(t, c, m, failers.FailureModeBlackhole, opts, settings, rng).(failers.PartialFailer)
-	failer.Setup(ctx)
+	failer := failers.MakeFailer(t, c, t.L(), m, failers.FailureModeBlackhole, opts, settings, rng).(failers.PartialFailer)
+	_ = failer.Setup(ctx)
 	defer failer.Cleanup(ctx)
 
 	c.Start(ctx, t.L(), opts, settings, c.Range(1, 7))
@@ -776,8 +776,8 @@ func runFailoverNonSystem(
 
 	m := c.NewMonitor(ctx, c.Range(1, 6))
 
-	failer := failers.MakeFailer(t, c, m, failureMode, opts, settings, rng)
-	failer.Setup(ctx)
+	failer := failers.MakeFailer(t, c, t.L(), m, failureMode, opts, settings, rng)
+	_ = failer.Setup(ctx)
 	defer failer.Cleanup(ctx)
 
 	c.Start(ctx, t.L(), opts, settings, c.Range(1, 6))
@@ -836,7 +836,7 @@ func runFailoverNonSystem(
 				failer.Ready(ctx, node)
 
 				t.L().Printf("failing n%d (%s)", node, failer)
-				failer.Fail(ctx, node)
+				_ = failer.Fail(ctx, node)
 
 				sleepFor(ctx, t, time.Minute)
 
@@ -885,8 +885,8 @@ func runFailoverLiveness(
 
 	m := c.NewMonitor(ctx, c.Range(1, 4))
 
-	failer := failers.MakeFailer(t, c, m, failureMode, opts, settings, rng)
-	failer.Setup(ctx)
+	failer := failers.MakeFailer(t, c, t.L(), m, failureMode, opts, settings, rng)
+	_ = failer.Setup(ctx)
 	defer failer.Cleanup(ctx)
 
 	c.Start(ctx, t.L(), opts, settings, c.Range(1, 4))
@@ -950,7 +950,7 @@ func runFailoverLiveness(
 			failer.Ready(ctx, 4)
 
 			t.L().Printf("failing n%d (%s)", 4, failer)
-			failer.Fail(ctx, 4)
+			_ = failer.Fail(ctx, 4)
 
 			sleepFor(ctx, t, time.Minute)
 
@@ -1000,8 +1000,8 @@ func runFailoverSystemNonLiveness(
 
 	m := c.NewMonitor(ctx, c.Range(1, 6))
 
-	failer := failers.MakeFailer(t, c, m, failureMode, opts, settings, rng)
-	failer.Setup(ctx)
+	failer := failers.MakeFailer(t, c, t.L(), m, failureMode, opts, settings, rng)
+	_ = failer.Setup(ctx)
 	defer failer.Cleanup(ctx)
 
 	c.Start(ctx, t.L(), opts, settings, c.Range(1, 6))
@@ -1067,7 +1067,7 @@ func runFailoverSystemNonLiveness(
 				failer.Ready(ctx, node)
 
 				t.L().Printf("failing n%d (%s)", node, failer)
-				failer.Fail(ctx, node)
+				_ = failer.Fail(ctx, node)
 
 				sleepFor(ctx, t, time.Minute)
 

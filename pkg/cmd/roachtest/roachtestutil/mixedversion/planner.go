@@ -176,6 +176,7 @@ const (
 // any mixedversion test plan.
 var planMutators = []mutator{
 	preserveDowngradeOptionRandomizerMutator{},
+	faultInjectorMutator{},
 }
 
 // Plan returns the TestPlan used to upgrade the cluster from the

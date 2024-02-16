@@ -24,8 +24,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
+	"github.com/cockroachdb/errors"
 	"github.com/lib/pq"
-	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -59,13 +60,14 @@ var AllFailureModes = []FailureMode{
 func MakeFailer(
 	t test.Test,
 	c cluster.Cluster,
+	l *logger.Logger,
 	m cluster.Monitor,
 	failureMode FailureMode,
 	opts option.StartOpts,
 	settings install.ClusterSettings,
 	rng *rand.Rand,
 ) Failer {
-	f := MakeFailerWithoutLocalNoop(t, c, m, failureMode, opts, settings, rng)
+	f := MakeFailerWithoutLocalNoop(t, c, l, m, failureMode, opts, settings, rng)
 	if c.IsLocal() && !f.CanUseLocal() {
 		t.L().Printf(
 			`failure mode %q not supported on local clusters, using "noop" failure mode instead`,
@@ -78,6 +80,7 @@ func MakeFailer(
 func MakeFailerWithoutLocalNoop(
 	t test.Test,
 	c cluster.Cluster,
+	l *logger.Logger,
 	m cluster.Monitor,
 	failureMode FailureMode,
 	opts option.StartOpts,
@@ -89,6 +92,7 @@ func MakeFailerWithoutLocalNoop(
 		return &BlackholeFailer{
 			t:      t,
 			c:      c,
+			l:      l,
 			input:  true,
 			output: true,
 		}
@@ -96,12 +100,14 @@ func MakeFailerWithoutLocalNoop(
 		return &BlackholeFailer{
 			t:     t,
 			c:     c,
+			l:     l,
 			input: true,
 		}
 	case FailureModeBlackholeSend:
 		return &BlackholeFailer{
 			t:      t,
 			c:      c,
+			l:      l,
 			output: true,
 		}
 	case FailureModeCrash:
@@ -127,15 +133,17 @@ func MakeFailerWithoutLocalNoop(
 		return &diskStallFailer{
 			t:             t,
 			c:             c,
+			l:             l,
 			m:             m,
 			startOpts:     opts,
 			startSettings: settings,
-			staller:       &DMSetupDiskStaller{t: t, c: c},
+			staller:       &DMSetupDiskStaller{c: c},
 		}
 	case FailureModePause:
 		return &pauseFailer{
 			t: t,
 			c: c,
+			l: l,
 		}
 	case FailureModeNoop:
 		return &noopFailer{}
@@ -161,7 +169,7 @@ type Failer interface {
 	CanRunWith(other FailureMode) bool
 
 	// Setup prepares the failer. It is called before the cluster is started.
-	Setup(ctx context.Context)
+	Setup(ctx context.Context) error
 
 	// Cleanup cleans up when the test exits. This is needed e.g. when the cluster
 	// is reused by a different test.
@@ -172,7 +180,7 @@ type Failer interface {
 	Ready(ctx context.Context, nodeID int)
 
 	// Fail fails the given node.
-	Fail(ctx context.Context, nodeID int)
+	Fail(ctx context.Context, nodeID int) error
 
 	// Recover recovers the given node.
 	Recover(ctx context.Context, nodeID int)
@@ -193,10 +201,10 @@ func (f *noopFailer) Mode() FailureMode                       { return FailureMo
 func (f *noopFailer) String() string                          { return string(f.Mode()) }
 func (f *noopFailer) CanUseLocal() bool                       { return true }
 func (f *noopFailer) CanRunWith(FailureMode) bool             { return true }
-func (f *noopFailer) Setup(context.Context)                   {}
+func (f *noopFailer) Setup(context.Context) error             { return nil }
 func (f *noopFailer) Ready(context.Context, int)              {}
 func (f *noopFailer) Cleanup(context.Context)                 {}
-func (f *noopFailer) Fail(context.Context, int)               {}
+func (f *noopFailer) Fail(context.Context, int) error         { return nil }
 func (f *noopFailer) FailPartial(context.Context, int, []int) {}
 func (f *noopFailer) Recover(context.Context, int)            {}
 
@@ -209,12 +217,13 @@ func (f *noopFailer) Recover(context.Context, int)            {}
 type BlackholeFailer struct {
 	t      test.Test
 	c      cluster.Cluster
+	l      *logger.Logger
 	input  bool
 	output bool
 }
 
 func NewBlackholeFailer(t test.Test, c cluster.Cluster, input, output bool) *BlackholeFailer {
-	return &BlackholeFailer{t, c, input, output}
+	return &BlackholeFailer{t, c, t.L(), input, output}
 }
 
 func (f *BlackholeFailer) Mode() FailureMode {
@@ -229,14 +238,14 @@ func (f *BlackholeFailer) Mode() FailureMode {
 func (f *BlackholeFailer) String() string              { return string(f.Mode()) }
 func (f *BlackholeFailer) CanUseLocal() bool           { return false } // needs iptables
 func (f *BlackholeFailer) CanRunWith(FailureMode) bool { return true }
-func (f *BlackholeFailer) Setup(context.Context)       {}
+func (f *BlackholeFailer) Setup(context.Context) error { return nil }
 func (f *BlackholeFailer) Ready(context.Context, int)  {}
 
 func (f *BlackholeFailer) Cleanup(ctx context.Context) {
 	f.c.Run(ctx, option.WithNodes(f.c.All()), `sudo iptables -F`)
 }
 
-func (f *BlackholeFailer) Fail(ctx context.Context, nodeID int) {
+func (f *BlackholeFailer) Fail(ctx context.Context, nodeID int) error {
 	pgport := fmt.Sprintf("{pgport:%d}", nodeID)
 
 	// When dropping both input and output, make sure we drop packets in both
@@ -250,22 +259,31 @@ func (f *BlackholeFailer) Fail(ctx context.Context, nodeID int) {
 	// outages in the wild.
 	if f.input && f.output {
 		// Inbound TCP connections, both received and sent packets.
-		f.c.Run(ctx, option.WithNodes(f.c.Node(nodeID)), fmt.Sprintf(`sudo iptables -A INPUT -p tcp --dport %s -j DROP`, pgport))
-		f.c.Run(ctx, option.WithNodes(f.c.Node(nodeID)), fmt.Sprintf(`sudo iptables -A OUTPUT -p tcp --sport %s -j DROP`, pgport))
+		if err := f.c.RunE(ctx, option.WithNodes(f.c.Node(nodeID)), fmt.Sprintf(`sudo iptables -A INPUT -p tcp --dport %s -j DROP`, pgport)); err != nil {
+			return err
+		}
+
+		if err := f.c.RunE(ctx, option.WithNodes(f.c.Node(nodeID)), fmt.Sprintf(`sudo iptables -A OUTPUT -p tcp --sport %s -j DROP`, pgport)); err != nil {
+			return err
+		}
 		// Outbound TCP connections, both sent and received packets.
-		f.c.Run(ctx, option.WithNodes(f.c.Node(nodeID)), fmt.Sprintf(`sudo iptables -A OUTPUT -p tcp --dport %s -j DROP`, pgport))
-		f.c.Run(ctx, option.WithNodes(f.c.Node(nodeID)), fmt.Sprintf(`sudo iptables -A INPUT -p tcp --sport %s -j DROP`, pgport))
+		if err := f.c.RunE(ctx, option.WithNodes(f.c.Node(nodeID)), fmt.Sprintf(`sudo iptables -A OUTPUT -p tcp --dport %s -j DROP`, pgport)); err != nil {
+			return err
+		}
+		return f.c.RunE(ctx, option.WithNodes(f.c.Node(nodeID)), fmt.Sprintf(`sudo iptables -A INPUT -p tcp --sport %s -j DROP`, pgport))
 	} else if f.input {
-		f.c.Run(ctx, option.WithNodes(f.c.Node(nodeID)), fmt.Sprintf(`sudo iptables -A INPUT -p tcp --dport %s -j DROP`, pgport))
+		return f.c.RunE(ctx, option.WithNodes(f.c.Node(nodeID)), fmt.Sprintf(`sudo iptables -A INPUT -p tcp --dport %s -j DROP`, pgport))
 	} else if f.output {
-		f.c.Run(ctx, option.WithNodes(f.c.Node(nodeID)), fmt.Sprintf(`sudo iptables -A OUTPUT -p tcp --dport %s -j DROP`, pgport))
+		return f.c.RunE(ctx, option.WithNodes(f.c.Node(nodeID)), fmt.Sprintf(`sudo iptables -A OUTPUT -p tcp --dport %s -j DROP`, pgport))
 	}
+
+	return nil
 }
 
 // FailPartial creates a partial blackhole failure between the given node and
 // peers.
 func (f *BlackholeFailer) FailPartial(ctx context.Context, nodeID int, peerIDs []int) {
-	peerIPs, err := f.c.InternalIP(ctx, f.t.L(), peerIDs)
+	peerIPs, err := f.c.InternalIP(ctx, f.l, peerIDs)
 	require.NoError(f.t, err)
 
 	for _, peerIP := range peerIPs {
@@ -319,13 +337,13 @@ func (f *crashFailer) Mode() FailureMode           { return FailureModeCrash }
 func (f *crashFailer) String() string              { return string(f.Mode()) }
 func (f *crashFailer) CanUseLocal() bool           { return true }
 func (f *crashFailer) CanRunWith(FailureMode) bool { return true }
-func (f *crashFailer) Setup(context.Context)       {}
+func (f *crashFailer) Setup(context.Context) error { return nil }
 func (f *crashFailer) Ready(context.Context, int)  {}
 func (f *crashFailer) Cleanup(context.Context)     {}
 
-func (f *crashFailer) Fail(ctx context.Context, nodeID int) {
+func (f *crashFailer) Fail(ctx context.Context, nodeID int) error {
 	f.m.ExpectDeath()
-	f.c.Stop(ctx, f.t.L(), option.DefaultStopOpts(), f.c.Node(nodeID)) // uses SIGKILL
+	return f.c.StopE(ctx, f.t.L(), option.DefaultStopOpts(), f.c.Node(nodeID)) // uses SIGKILL
 }
 
 func (f *crashFailer) Recover(ctx context.Context, nodeID int) {
@@ -354,7 +372,7 @@ func (f *DeadlockFailer) Mode() FailureMode             { return FailureModeDead
 func (f *DeadlockFailer) String() string                { return string(f.Mode()) }
 func (f *DeadlockFailer) CanUseLocal() bool             { return true }
 func (f *DeadlockFailer) CanRunWith(m FailureMode) bool { return true }
-func (f *DeadlockFailer) Setup(context.Context)         {}
+func (f *DeadlockFailer) Setup(context.Context) error   { return nil }
 func (f *DeadlockFailer) Cleanup(context.Context)       {}
 
 func (f *DeadlockFailer) Ready(ctx context.Context, nodeID int) {
@@ -385,7 +403,7 @@ func (f *DeadlockFailer) Ready(ctx context.Context, nodeID int) {
 	require.NoError(f.t, rows.Err())
 }
 
-func (f *DeadlockFailer) Fail(ctx context.Context, nodeID int) {
+func (f *DeadlockFailer) Fail(ctx context.Context, nodeID int) error {
 	require.NotZero(f.t, f.NumReplicas)
 	if f.locks == nil {
 		f.locks = map[int][]roachpb.RangeID{}
@@ -420,6 +438,7 @@ func (f *DeadlockFailer) Fail(ctx context.Context, nodeID int) {
 	// replicas may also have moved in the meanwhile. Just assert that we were able
 	// to lock at least 1 replica.
 	require.NotEmpty(f.t, f.locks[nodeID], "didn't lock any replicas")
+	return nil
 }
 
 func (f *DeadlockFailer) Recover(ctx context.Context, nodeID int) {
@@ -465,6 +484,7 @@ func (f *DeadlockFailer) Recover(ctx context.Context, nodeID int) {
 type diskStallFailer struct {
 	t             test.Test
 	c             cluster.Cluster
+	l             *logger.Logger
 	m             cluster.Monitor
 	startOpts     option.StartOpts
 	startSettings install.ClusterSettings
@@ -476,39 +496,39 @@ func (f *diskStallFailer) String() string              { return string(f.Mode())
 func (f *diskStallFailer) CanUseLocal() bool           { return false } // needs dmsetup
 func (f *diskStallFailer) CanRunWith(FailureMode) bool { return true }
 
-func (f *diskStallFailer) Setup(ctx context.Context) {
-	f.staller.Setup(ctx)
+func (f *diskStallFailer) Setup(ctx context.Context) error {
+	return f.staller.Setup(ctx)
 }
 
 func (f *diskStallFailer) Cleanup(ctx context.Context) {
 	f.staller.Unstall(ctx, f.c.All())
 	// We have to stop the cluster before cleaning up the staller.
 	f.m.ExpectDeaths(int32(f.c.Spec().NodeCount))
-	f.c.Stop(ctx, f.t.L(), option.DefaultStopOpts(), f.c.All())
+	f.c.Stop(ctx, f.l, option.DefaultStopOpts(), f.c.All())
 	f.staller.Cleanup(ctx)
 }
 
 func (f *diskStallFailer) Ready(ctx context.Context, nodeID int) {
 	// Other failure modes may have disabled the disk stall detector (see
 	// pauseFailer), so we explicitly enable it.
-	conn := f.c.Conn(ctx, f.t.L(), nodeID)
+	conn := f.c.Conn(ctx, f.l, nodeID)
 	_, err := conn.ExecContext(ctx,
 		`SET CLUSTER SETTING storage.max_sync_duration.fatal.enabled = true`)
 	require.NoError(f.t, err)
 }
 
-func (f *diskStallFailer) Fail(ctx context.Context, nodeID int) {
+func (f *diskStallFailer) Fail(ctx context.Context, nodeID int) error {
 	// Pebble's disk stall detector should crash the node.
 	f.m.ExpectDeath()
-	f.staller.Stall(ctx, f.c.Node(nodeID))
+	return f.staller.Stall(ctx, f.c.Node(nodeID))
 }
 
 func (f *diskStallFailer) Recover(ctx context.Context, nodeID int) {
 	f.staller.Unstall(ctx, f.c.Node(nodeID))
 	// Pebble's disk stall detector should have terminated the node, but in case
 	// it didn't, we explicitly stop it first.
-	f.c.Stop(ctx, f.t.L(), option.DefaultStopOpts(), f.c.Node(nodeID))
-	f.c.Start(ctx, f.t.L(), f.startOpts, f.startSettings, f.c.Node(nodeID))
+	f.c.Stop(ctx, f.l, option.DefaultStopOpts(), f.c.Node(nodeID))
+	f.c.Start(ctx, f.l, f.startOpts, f.startSettings, f.c.Node(nodeID))
 }
 
 // pauseFailer pauses the process, but keeps the OS (and thus network
@@ -516,13 +536,14 @@ func (f *diskStallFailer) Recover(ctx context.Context, nodeID int) {
 type pauseFailer struct {
 	t test.Test
 	c cluster.Cluster
+	l *logger.Logger
 }
 
-func (f *pauseFailer) Mode() FailureMode       { return FailureModePause }
-func (f *pauseFailer) String() string          { return string(f.Mode()) }
-func (f *pauseFailer) CanUseLocal() bool       { return true }
-func (f *pauseFailer) Setup(context.Context)   {}
-func (f *pauseFailer) Cleanup(context.Context) {}
+func (f *pauseFailer) Mode() FailureMode           { return FailureModePause }
+func (f *pauseFailer) String() string              { return string(f.Mode()) }
+func (f *pauseFailer) CanUseLocal() bool           { return true }
+func (f *pauseFailer) Setup(context.Context) error { return nil }
+func (f *pauseFailer) Cleanup(context.Context)     {}
 
 func (f *pauseFailer) CanRunWith(other FailureMode) bool {
 	// Since we disable the disk stall detector, we can't run concurrently with
@@ -534,46 +555,46 @@ func (f *pauseFailer) Ready(ctx context.Context, nodeID int) {
 	// The process pause can trip the disk stall detector, so we disable it. We
 	// could let it fire, but we'd like to see if the node can recover from the
 	// pause and keep working. It will be re-enabled by diskStallFailer.Ready().
-	conn := f.c.Conn(ctx, f.t.L(), nodeID)
+	conn := f.c.Conn(ctx, f.l, nodeID)
 	_, err := conn.ExecContext(ctx,
 		`SET CLUSTER SETTING storage.max_sync_duration.fatal.enabled = false`)
 	require.NoError(f.t, err)
 }
 
-func (f *pauseFailer) Fail(ctx context.Context, nodeID int) {
-	f.c.Signal(ctx, f.t.L(), 19, f.c.Node(nodeID)) // SIGSTOP
+func (f *pauseFailer) Fail(ctx context.Context, nodeID int) error {
+	return f.c.SignalE(ctx, f.l, 19, f.c.Node(nodeID)) // SIGSTOP
 }
 
 func (f *pauseFailer) Recover(ctx context.Context, nodeID int) {
-	f.c.Signal(ctx, f.t.L(), 18, f.c.Node(nodeID)) // SIGCONT
+	f.c.Signal(ctx, f.l, 18, f.c.Node(nodeID)) // SIGCONT
 	// NB: We don't re-enable the disk stall detector here, but instead rely on
 	// diskStallFailer.Ready to ensure it's enabled, since the cluster likely
 	// hasn't recovered yet and we may fail to set the cluster setting.
 }
 
 type DiskStaller interface {
-	Setup(ctx context.Context)
+	Setup(ctx context.Context) error
 	Cleanup(ctx context.Context)
-	Stall(ctx context.Context, nodes option.NodeListOption)
+	Stall(ctx context.Context, nodes option.NodeListOption) error
 	Unstall(ctx context.Context, nodes option.NodeListOption)
 	DataDir() string
 	LogDir() string
 }
 
 type DMSetupDiskStaller struct {
-	t test.Test
 	c cluster.Cluster
+	l *logger.Logger
 }
 
-func NewDMSetupDiskStaller(t test.Test, c cluster.Cluster) *DMSetupDiskStaller {
-	return &DMSetupDiskStaller{t, c}
+func NewDMSetupDiskStaller(c cluster.Cluster, l *logger.Logger) *DMSetupDiskStaller {
+	return &DMSetupDiskStaller{c, l}
 }
 
 var _ DiskStaller = (*DMSetupDiskStaller)(nil)
 
-func (s *DMSetupDiskStaller) device() string { return getDevice(s.t, s.c) }
+func (s *DMSetupDiskStaller) device() string { return getDevice(s.c) }
 
-func (s *DMSetupDiskStaller) Setup(ctx context.Context) {
+func (s *DMSetupDiskStaller) Setup(ctx context.Context) error {
 	dev := s.device()
 	// snapd will run "snapd auto-import /dev/dm-0" via udev triggers when
 	// /dev/dm-0 is created. This possibly interferes with the dmsetup create
@@ -586,10 +607,12 @@ func (s *DMSetupDiskStaller) Setup(ctx context.Context) {
 	if err != nil {
 		// This has occasionally been seen to fail with "Device or resource busy",
 		// with no clear explanation. Try to find out who it is.
-		s.c.Run(ctx, option.WithNodes(s.c.All()), "sudo bash -c 'ps aux; dmsetup status; mount; lsof'")
-		s.t.Fatal(err)
+		if err := s.c.RunE(ctx, option.WithNodes(s.c.All()), "sudo bash -c 'ps aux; dmsetup status; mount; lsof'"); err != nil {
+			s.l.Printf("ERROR: %w", err)
+		}
+		return err
 	}
-	s.c.Run(ctx, option.WithNodes(s.c.All()), `sudo mount /dev/mapper/data1 /mnt/data1`)
+	return s.c.RunE(ctx, option.WithNodes(s.c.All()), `sudo mount /dev/mapper/data1 /mnt/data1`)
 }
 
 func (s *DMSetupDiskStaller) Cleanup(ctx context.Context) {
@@ -601,8 +624,8 @@ func (s *DMSetupDiskStaller) Cleanup(ctx context.Context) {
 	s.c.Run(ctx, option.WithNodes(s.c.All()), `sudo apt-get install -y snapd`)
 }
 
-func (s *DMSetupDiskStaller) Stall(ctx context.Context, nodes option.NodeListOption) {
-	s.c.Run(ctx, option.WithNodes(nodes), `sudo dmsetup suspend --noflush --nolockfs data1`)
+func (s *DMSetupDiskStaller) Stall(ctx context.Context, nodes option.NodeListOption) error {
+	return s.c.RunE(ctx, option.WithNodes(nodes), `sudo dmsetup suspend --noflush --nolockfs data1`)
 }
 
 func (s *DMSetupDiskStaller) Unstall(ctx context.Context, nodes option.NodeListOption) {
@@ -631,15 +654,20 @@ func (s *CGroupDiskStaller) DataDir() string { return "{store-dir}" }
 func (s *CGroupDiskStaller) LogDir() string {
 	return "logs"
 }
-func (s *CGroupDiskStaller) Setup(ctx context.Context) {
+func (s *CGroupDiskStaller) Setup(ctx context.Context) error {
 	if s.logsToo {
-		s.c.Run(ctx, option.WithNodes(s.c.All()), "mkdir -p {store-dir}/logs")
-		s.c.Run(ctx, option.WithNodes(s.c.All()), "rm -f logs && ln -s {store-dir}/logs logs || true")
+		err1 := s.c.RunE(ctx, option.WithNodes(s.c.All()), "mkdir -p {store-dir}/logs")
+		err2 := s.c.RunE(ctx, option.WithNodes(s.c.All()), "rm -f logs && ln -s {store-dir}/logs logs || true")
+
+		return errors.CombineErrors(err1, err2)
 	}
+
+	return nil
 }
+
 func (s *CGroupDiskStaller) Cleanup(ctx context.Context) {}
 
-func (s *CGroupDiskStaller) Stall(ctx context.Context, nodes option.NodeListOption) {
+func (s *CGroupDiskStaller) Stall(ctx context.Context, nodes option.NodeListOption) error {
 	// Shuffle the order of read and write stall initiation.
 	rand.Shuffle(len(s.readOrWrite), func(i, j int) {
 		s.readOrWrite[i], s.readOrWrite[j] = s.readOrWrite[j], s.readOrWrite[i]
@@ -649,9 +677,11 @@ func (s *CGroupDiskStaller) Stall(ctx context.Context, nodes option.NodeListOpti
 		// bytesPerSecond={0,1} results in Invalid argument from the io.max
 		// cgroupv2 API.
 		if err := s.setThroughput(ctx, nodes, rw, throughput{limited: true, bytesPerSecond: 4}); err != nil {
-			s.t.Fatal(err)
+			return err
 		}
 	}
+
+	return nil
 }
 
 func (s *CGroupDiskStaller) Unstall(ctx context.Context, nodes option.NodeListOption) {
@@ -722,14 +752,13 @@ func (s *CGroupDiskStaller) setThroughput(
 	))
 }
 
-func getDevice(t test.Test, c cluster.Cluster) string {
+func getDevice(c cluster.Cluster) string {
 	switch c.Cloud() {
 	case spec.GCE:
-		return "/dev/sdb"
+		return "/dev/nvme0n1"
 	case spec.AWS:
 		return "/dev/nvme1n1"
 	default:
-		t.Fatalf("unsupported cloud %q", c.Cloud())
-		return ""
+		panic(fmt.Errorf("unsupported cloud %q", c.Cloud()))
 	}
 }
