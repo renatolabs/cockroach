@@ -1103,14 +1103,17 @@ func (c *SyncedCluster) createAdminUserForSecureCluster(
 				"-e", stmts,
 			})
 
-		if err != nil || results[0].Err != nil {
-			err := errors.CombineErrors(err, results[0].Err)
+		if err := errors.CombineErrors(err, results[0].Err); err != nil {
+			if out := results[0].CombinedOut; out != "" {
+				err = errors.WithDetailf(err, "output:\n%s", out)
+			}
+
 			return err
 		}
 
 		return nil
 	}); err != nil {
-		l.Printf("not creating default admin user due to error: %v", err)
+		l.Printf("not creating default admin user due to error: %#v", err)
 		return
 	}
 

@@ -1021,7 +1021,7 @@ func (r *testRunner) runTest(
 				failureMsg := t.failureMsg()
 				preemptedVMNames := getPreemptedVMNames(ctx, c, l)
 				if preemptedVMNames != "" {
-					failureMsg = fmt.Sprintf("VMs preempted during the test run : %s\n\n**Other Failure**\n%s", preemptedVMNames, failureMsg)
+					failureMsg = fmt.Sprintf("VMs preempted during the test run: %s\n\n**Other Failure**\n%s", preemptedVMNames, failureMsg)
 					// Reset failures in the test so that the VM preemption
 					// error is the one that is taken into account when
 					// reporting the failure. Note any other failures that
