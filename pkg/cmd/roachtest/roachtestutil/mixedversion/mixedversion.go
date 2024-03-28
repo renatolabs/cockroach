@@ -124,6 +124,10 @@ const (
 	// cluster that can use the test fixtures in
 	// `pkg/cmd/roachtest/fixtures`.
 	numNodesInFixtures = 4
+
+	// These `*Deployment` constants are used to indicate different
+	// deployment modes that a test may choose to enable/disable.
+	NonUADeployment = DeploymentMode("non-ua")
 )
 
 var (
@@ -158,6 +162,7 @@ var (
 		maxUpgrades:                    4,
 		minimumSupportedVersion:        OldestSupportedVersion,
 		predecessorFunc:                randomPredecessorHistory,
+		enabledDeploymentModes:         []DeploymentMode{NonUADeployment},
 		overriddenMutatorProbabilities: make(map[string]float64),
 	}
 
@@ -261,6 +266,7 @@ type (
 		minimumSupportedVersion        *clusterupgrade.Version
 		predecessorFunc                predecessorFunc
 		settings                       []install.ClusterSettingOption
+		enabledDeploymentModes         []DeploymentMode
 		overriddenMutatorProbabilities map[string]float64
 	}
 
@@ -313,6 +319,8 @@ type (
 	// authors when they want to stop a background step as part of test
 	// logic itself, without causing the test to fail.
 	StopFunc func()
+
+	DeploymentMode string
 )
 
 // NeverUseFixtures is an option that can be passed to `NewTest` to
@@ -381,6 +389,16 @@ func MinimumSupportedVersion(v string) CustomOption {
 func ClusterSettingOption(opt ...install.ClusterSettingOption) CustomOption {
 	return func(opts *testOptions) {
 		opts.settings = append(opts.settings, opt...)
+	}
+}
+
+// EnabledDeploymentModes restricts the test to only run in the
+// provided deployment modes, in case the test is incompatible with a
+// certain mode. Each test runs will pick a random deployment mode
+// within the list of enabled modes.
+func EnabledDeploymentModes(modes ...DeploymentMode) CustomOption {
+	return func(opts *testOptions) {
+		opts.enabledDeploymentModes = modes
 	}
 }
 
@@ -605,9 +623,14 @@ func (t *Test) plan() (*TestPlan, error) {
 		return nil, err
 	}
 
+	// Pick a random deployment mode to use in this test run among the
+	// list of enabled deployment modes enabled for this test.
+	deploymentMode := t.options.enabledDeploymentModes[t.prng.Intn(len(t.options.enabledDeploymentModes))]
 	initialRelease := previousReleases[0]
+
 	planner := testPlanner{
 		versions:       append(previousReleases, clusterupgrade.CurrentVersion()),
+		deploymentMode: deploymentMode,
 		currentContext: newInitialContext(initialRelease, t.crdbNodes, nil /* tenant */),
 		options:        t.options,
 		rt:             t.rt,
@@ -892,20 +915,26 @@ func rngFromRNG(rng *rand.Rand) *rand.Rand {
 }
 
 func assertValidTest(test *Test, fatalFunc func(...interface{})) {
-	if test.options.useFixturesProbability > 0 && len(test.crdbNodes) != numNodesInFixtures {
-		err := fmt.Errorf(
-			"invalid cluster: use of fixtures requires %d cockroach nodes, got %d (%v)",
-			numNodesInFixtures, len(test.crdbNodes), test.crdbNodes,
-		)
+	fail := func(err error) {
 		fatalFunc(errors.Wrap(err, "mixedversion.NewTest"))
 	}
 
-	if test.options.minUpgrades > test.options.maxUpgrades {
-		err := fmt.Errorf(
-			"invalid test options: maxUpgrades (%d) must be greater than minUpgrades (%d)",
-			test.options.maxUpgrades, test.options.minUpgrades,
+	if test.options.useFixturesProbability > 0 && len(test.crdbNodes) != numNodesInFixtures {
+		fail(
+			fmt.Errorf(
+				"invalid cluster: use of fixtures requires %d cockroach nodes, got %d (%v)",
+				numNodesInFixtures, len(test.crdbNodes), test.crdbNodes,
+			),
 		)
-		fatalFunc(errors.Wrap(err, "mixedversion.NewTest"))
+	}
+
+	if test.options.minUpgrades > test.options.maxUpgrades {
+		fail(
+			fmt.Errorf(
+				"invalid test options: maxUpgrades (%d) must be greater than minUpgrades (%d)",
+				test.options.maxUpgrades, test.options.minUpgrades,
+			),
+		)
 	}
 
 	currentVersion := clusterupgrade.CurrentVersion()
@@ -917,10 +946,15 @@ func assertValidTest(test *Test, fatalFunc func(...interface{})) {
 		(msv.Major() == currentVersion.Major() && msv.Minor() < currentVersion.Minor())
 
 	if !validVersion {
-		err := fmt.Errorf(
-			"invalid test options: minimum supported version (%s) should be from an older release series than current version (%s)",
-			msv.Version.String(), currentVersion.Version.String(),
+		fail(
+			fmt.Errorf(
+				"invalid test options: minimum supported version (%s) should be from an older release series than current version (%s)",
+				msv.Version.String(), currentVersion.Version.String(),
+			),
 		)
-		fatalFunc(errors.Wrap(err, "mixedversion.NewTest"))
+	}
+
+	if len(test.options.enabledDeploymentModes) == 0 {
+		fail(fmt.Errorf("invalid test options: no deployment modes enabled"))
 	}
 }
