@@ -451,7 +451,7 @@ func Test_stepSelectorFilter(t *testing.T) {
 		{
 			name: "filter eliminates all steps",
 			predicate: func(s *singleStep) bool {
-				return s.context.Stage == BackgroundStage // no background steps in the plan used in the test
+				return s.context.System.Stage == BackgroundStage // no background steps in the plan used in the test
 			},
 			assertStepsFunc: func(t *testing.T, sel stepSelector) {
 				require.Empty(t, sel)
@@ -461,7 +461,7 @@ func Test_stepSelectorFilter(t *testing.T) {
 		{
 			name: "filtering by a specific stage",
 			predicate: func(s *singleStep) bool {
-				return s.context.Stage == AfterUpgradeFinalizedStage
+				return s.context.System.Stage == AfterUpgradeFinalizedStage
 			},
 			assertStepsFunc: func(t *testing.T, sel stepSelector) {
 				require.Len(t, sel, 3) // number of upgrades we are performing
@@ -476,7 +476,7 @@ func Test_stepSelectorFilter(t *testing.T) {
 		{
 			name: "filtering by a specific stage and upgrade cycle",
 			predicate: func(s *singleStep) bool {
-				return s.context.ToVersion.IsCurrent() && s.context.Stage == AfterUpgradeFinalizedStage
+				return s.context.System.ToVersion.IsCurrent() && s.context.System.Stage == AfterUpgradeFinalizedStage
 			},
 			assertStepsFunc: func(t *testing.T, sel stepSelector) {
 				require.Len(t, sel, 1)
@@ -562,7 +562,7 @@ func Test_stepSelectorMutations(t *testing.T) {
 			name:        "insert step when filter has no matches",
 			numUpgrades: 1,
 			predicate: func(s *singleStep) bool {
-				return s.context.Stage == BackgroundStage // no background steps
+				return s.context.System.Stage == BackgroundStage // no background steps
 			},
 			op: "insert",
 			assertMutationsFunc: func(t *testing.T, step *singleStep, mutations []mutation) {
@@ -573,7 +573,7 @@ func Test_stepSelectorMutations(t *testing.T) {
 			name:        "insert step in single upgrade, single step filtered",
 			numUpgrades: 1,
 			predicate: func(s *singleStep) bool {
-				return s.context.Stage == AfterUpgradeFinalizedStage
+				return s.context.System.Stage == AfterUpgradeFinalizedStage
 			},
 			op: "insert",
 			assertMutationsFunc: func(t *testing.T, step *singleStep, mutations []mutation) {
@@ -587,7 +587,7 @@ func Test_stepSelectorMutations(t *testing.T) {
 			name:        "insert step in multiple upgrade plan",
 			numUpgrades: 3,
 			predicate: func(s *singleStep) bool {
-				return s.context.Stage == AfterUpgradeFinalizedStage
+				return s.context.System.Stage == AfterUpgradeFinalizedStage
 			},
 			op: "insert",
 			assertMutationsFunc: func(t *testing.T, step *singleStep, mutations []mutation) {
@@ -601,7 +601,7 @@ func Test_stepSelectorMutations(t *testing.T) {
 			name:        "remove step when filter has no matches",
 			numUpgrades: 1,
 			predicate: func(s *singleStep) bool {
-				return s.context.Stage == BackgroundStage // no background steps
+				return s.context.System.Stage == BackgroundStage // no background steps
 			},
 			op: "remove",
 			assertMutationsFunc: func(t *testing.T, _ *singleStep, mutations []mutation) {
@@ -612,7 +612,7 @@ func Test_stepSelectorMutations(t *testing.T) {
 			name:        "remove step in single upgrade, single step filtered",
 			numUpgrades: 1,
 			predicate: func(s *singleStep) bool {
-				return s.context.Stage == AfterUpgradeFinalizedStage
+				return s.context.System.Stage == AfterUpgradeFinalizedStage
 			},
 			op: "remove",
 			assertMutationsFunc: func(t *testing.T, _ *singleStep, mutations []mutation) {
@@ -626,7 +626,7 @@ func Test_stepSelectorMutations(t *testing.T) {
 			name:        "remove step in multiple upgrade plan",
 			numUpgrades: 3,
 			predicate: func(s *singleStep) bool {
-				return s.context.Stage == AfterUpgradeFinalizedStage
+				return s.context.System.Stage == AfterUpgradeFinalizedStage
 			},
 			op: "remove",
 			assertMutationsFunc: func(t *testing.T, _ *singleStep, mutations []mutation) {
