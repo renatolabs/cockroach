@@ -173,8 +173,8 @@ func newContext(
 	makeContext := func(name string, nodes option.NodeListOption) *ServiceContext {
 		return &ServiceContext{
 			Descriptor: &ServiceDescriptor{
-				Name:  install.SystemInterfaceName,
-				Nodes: systemNodes,
+				Name:  name,
+				Nodes: nodes,
 			},
 			Stage:       stage,
 			FromVersion: from,

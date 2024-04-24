@@ -46,5 +46,5 @@ Plan:
    │   ├── restart node 2 with binary version <current> (16) [stage=last-upgrade]
    │   ├── testSingleStep (17) [stage=last-upgrade]
    │   └── restart node 3 with binary version <current> (18) [stage=last-upgrade]
-   ├── allow upgrade to happen by resetting `preserve_downgrade_option` (19) [stage=running-upgrade-migrations,finalizing]
+   ├── allow upgrade to happen on system tenant by resetting `preserve_downgrade_option` (19) [stage=running-upgrade-migrations,finalizing]
    └── wait for system tenant on nodes :1-4 to reach cluster version <current> (20) [stage=running-upgrade-migrations,finalizing]

@@ -34,7 +34,7 @@ Plan:
 │   │   ├── run "my mixed-version feature" (7)
 │   │   ├── restart node 4 with binary version v23.1.10 (8)
 │   │   └── restart node 1 with binary version v23.1.10 (9)
-│   ├── allow upgrade to happen by resetting `preserve_downgrade_option` (10)
+│   ├── allow upgrade to happen on system tenant by resetting `preserve_downgrade_option` (10)
 │   ├── run "my mixed-version feature" (11)
 │   └── wait for system tenant on nodes :1-4 to reach cluster version '23.1' (12)
 ├── upgrade cluster from "v23.1.10" to "v23.2.4"
@@ -62,7 +62,7 @@ Plan:
 │   │   ├── set cluster setting "test_cluster_setting" to 1 on system tenant (30)
 │   │   └── restart node 2 with binary version v23.2.4 (31)
 │   ├── reset cluster setting "test_cluster_setting" on system tenant (32)
-│   ├── allow upgrade to happen by resetting `preserve_downgrade_option` (33)
+│   ├── allow upgrade to happen on system tenant by resetting `preserve_downgrade_option` (33)
 │   ├── wait for system tenant on nodes :1-4 to reach cluster version '23.2' (34)
 │   └── set cluster setting "test_cluster_setting" to 2 on system tenant (35)
 └── upgrade cluster from "v23.2.4" to "<current>"
@@ -84,6 +84,6 @@ Plan:
    │   ├── restart node 3 with binary version <current> (48)
    │   ├── restart node 4 with binary version <current> (49)
    │   └── restart node 1 with binary version <current> (50)
-   ├── allow upgrade to happen by resetting `preserve_downgrade_option` (51)
+   ├── allow upgrade to happen on system tenant by resetting `preserve_downgrade_option` (51)
    ├── run "my mixed-version feature" (52)
    └── wait for system tenant on nodes :1-4 to reach cluster version <current> (53)

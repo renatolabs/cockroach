@@ -76,6 +76,10 @@ func (s *Service) RandomDB(rng *rand.Rand) (int, *gosql.DB) {
 	return node, s.Connect(node)
 }
 
+func (s *Service) PGURL() string {
+	return fmt.Sprintf("{pgurl%s:%s}", s.Descriptor.Nodes.String(), s.Descriptor.Name)
+}
+
 func (s *Service) prepareQuery(
 	rng *rand.Rand, nodes option.NodeListOption, query string, args ...any,
 ) (*gosql.DB, error) {
@@ -172,6 +176,10 @@ func (h *Helper) Connect(node int) *gosql.DB {
 
 func (h *Helper) RandomDB(rng *rand.Rand) (int, *gosql.DB) {
 	return h.DefaultService().RandomDB(rng)
+}
+
+func (h *Helper) PGURL() string {
+	return h.DefaultService().PGURL()
 }
 
 // Query performs `db.QueryContext` on a randomly picked database node. The

@@ -16,6 +16,7 @@ import (
 	"math/rand"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/stretchr/testify/require"
 )
@@ -60,11 +61,15 @@ func testAddAnnotation() error {
 
 func testTestRunner() *testRunner {
 	runnerCtx, cancel := context.WithCancel(ctx)
+	systemDescriptor := &ServiceDescriptor{
+		Name:  install.SystemInterfaceName,
+		Nodes: nodes,
+	}
 	return &testRunner{
 		ctx:            runnerCtx,
 		cancel:         cancel,
 		logger:         nilLogger,
-		crdbNodes:      nodes,
+		systemService:  newServiceRuntime(systemDescriptor),
 		background:     newBackgroundRunner(runnerCtx, nilLogger),
 		seed:           seed,
 		_addAnnotation: testAddAnnotation,

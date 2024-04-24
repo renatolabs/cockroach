@@ -25,6 +25,9 @@ import (
 type (
 	// TestPlan is the output of planning a mixed-version test.
 	TestPlan struct {
+		// services is the list of services being upgraded as part of this
+		// test plan.
+		services []*ServiceDescriptor
 		// setup groups together steps that setup the cluster for a test
 		// run. This involves starting the cockroach process in the
 		// initial version, installing fixtures, running initial upgrades,
@@ -34,9 +37,12 @@ type (
 		// performed when the test starts (i.e., the cluster is running in
 		// a supported version).
 		initSteps []testStep
-		// startClusterID is the step ID after which the cluster should be
-		// ready to receive connections.
-		startClusterID int
+		// startSystemID is the step ID after which the system tenant
+		// should be ready to receive connections.
+		startSystemID int
+		// startTenantID is the step ID after which the secondary tenant,
+		// if any, should be ready to receive connections.
+		startTenantID int
 		// upgrades is the list of upgrade plans to be performed during
 		// the run encoded by this plan. These upgrades happen *after*
 		// every update in `setup` is finished.
@@ -68,7 +74,6 @@ type (
 		versions       []*clusterupgrade.Version
 		deploymentMode DeploymentMode
 		currentContext *Context
-		crdbNodes      option.NodeListOption
 		rt             test.Test
 		isLocal        bool
 		options        testOptions
@@ -236,7 +241,11 @@ func (p *testPlanner) Plan() *TestPlan {
 		scheduleHooks := fromVersion.AtLeast(p.options.minimumSupportedVersion)
 
 		plan := newUpgradePlan(fromVersion, toVersion)
-		p.currentContext.System.startUpgrade(toVersion)
+		for _, sc := range []*ServiceContext{p.currentContext.System, p.currentContext.Tenant} {
+			if sc != nil {
+				sc.startUpgrade(toVersion)
+			}
+		}
 		plan.Add(p.initUpgradeSteps())
 		if p.shouldRollback(toVersion) {
 			// previous -> next
@@ -261,6 +270,7 @@ func (p *testPlanner) Plan() *TestPlan {
 	}
 
 	testPlan := &TestPlan{
+		services:       p.services(),
 		setup:          setup,
 		initSteps:      p.testStartSteps(),
 		upgrades:       testUpgrades,
@@ -316,7 +326,7 @@ func (p *testPlanner) clusterSetupSteps() []testStep {
 			settings: p.clusterSettings(),
 		}),
 		p.newSingleStep(waitForStableClusterVersionStep{
-			nodes:              p.crdbNodes,
+			nodes:              p.currentContext.System.Descriptor.Nodes,
 			timeout:            p.options.upgradeTimeout,
 			desiredVersion:     versionToClusterVersion(initialVersion),
 			virtualClusterName: install.SystemInterfaceName,
@@ -327,10 +337,20 @@ func (p *testPlanner) clusterSetupSteps() []testStep {
 	case NonUADeployment:
 		return steps
 
-	default:
-		p.rt.Fatalf("unknown deployment mode: %v", p.deploymentMode)
-		return nil
+	case UASharedProcessDeployment:
+		return append(
+			steps,
+			p.newSingleStep(startSharedProcessVirtualClusterStep{name: p.tenantName()}),
+			p.newSingleStep(waitForStableClusterVersionStep{
+				nodes:              p.currentContext.Tenant.Descriptor.Nodes,
+				timeout:            p.options.upgradeTimeout,
+				desiredVersion:     versionToClusterVersion(initialVersion),
+				virtualClusterName: p.tenantName(),
+			}),
+		)
 	}
+
+	panic(unreachable)
 }
 
 // startupSteps returns the list of steps that should be executed once
@@ -354,10 +374,22 @@ func (p *testPlanner) testStartSteps() []testStep {
 // executed before we start changing binaries on nodes in the process
 // of upgrading/downgrading.
 func (p *testPlanner) initUpgradeSteps() []testStep {
-	p.currentContext.System.Stage = InitUpgradeStage
-	return []testStep{p.newSingleStep(preserveDowngradeOptionStep{
-		virtualClusterName: install.SystemInterfaceName,
-	})}
+	p.currentContext.SetStage(InitUpgradeStage)
+
+	preserveDowngradeForService := func(name string) *singleStep {
+		return p.newSingleStep(preserveDowngradeOptionStep{
+			virtualClusterName: name,
+		})
+	}
+
+	steps := []testStep{preserveDowngradeForService(install.SystemInterfaceName)}
+
+	switch p.deploymentMode {
+	case UASharedProcessDeployment:
+		steps = append(steps, preserveDowngradeForService(p.tenantName()))
+	}
+
+	return steps
 }
 
 // afterUpgradeSteps are the steps to be run once the nodes have been
@@ -382,7 +414,8 @@ func (p *testPlanner) upgradeSteps(
 	stage UpgradeStage, from, to *clusterupgrade.Version, scheduleHooks bool,
 ) []testStep {
 	p.currentContext.System.Stage = stage
-	msg := fmt.Sprintf("upgrade nodes %v from %q to %q", p.crdbNodes, from.String(), to.String())
+	nodes := p.currentContext.System.Descriptor.Nodes
+	msg := fmt.Sprintf("upgrade nodes %v from %q to %q", nodes, from.String(), to.String())
 	return p.changeVersionSteps(from, to, msg, scheduleHooks)
 }
 
@@ -390,7 +423,8 @@ func (p *testPlanner) downgradeSteps(
 	from, to *clusterupgrade.Version, scheduleHooks bool,
 ) []testStep {
 	p.currentContext.System.Stage = RollbackUpgradeStage
-	msg := fmt.Sprintf("downgrade nodes %v from %q to %q", p.crdbNodes, from.String(), to.String())
+	nodes := p.currentContext.System.Descriptor.Nodes
+	msg := fmt.Sprintf("downgrade nodes %v from %q to %q", nodes, from.String(), to.String())
 	return p.changeVersionSteps(from, to, msg, scheduleHooks)
 }
 
@@ -403,8 +437,9 @@ func (p *testPlanner) downgradeSteps(
 func (p *testPlanner) changeVersionSteps(
 	from, to *clusterupgrade.Version, label string, scheduleHooks bool,
 ) []testStep {
-	// copy `crdbNodes` here so that shuffling won't mutate that array
-	previousVersionNodes := append(option.NodeListOption{}, p.crdbNodes...)
+	nodes := p.currentContext.System.Descriptor.Nodes
+	// copy system `Nodes` here so that shuffling won't mutate that array
+	previousVersionNodes := append(option.NodeListOption{}, nodes...)
 
 	// change the binary version on the nodes in random order
 	p.prng.Shuffle(len(previousVersionNodes), func(i, j int) {
@@ -425,8 +460,12 @@ func (p *testPlanner) changeVersionSteps(
 		steps = append(steps, p.newSingleStep(
 			restartWithNewBinaryStep{version: to, node: node, rt: p.rt, settings: p.clusterSettings()},
 		))
-		err := p.currentContext.System.changeVersion(node, to)
-		handleInternalError(err)
+		for _, sc := range []*ServiceContext{p.currentContext.System, p.currentContext.Tenant} {
+			if sc != nil {
+				err := sc.changeVersion(node, to)
+				handleInternalError(err)
+			}
+		}
 
 		if scheduleHooks {
 			steps = append(steps, p.hooks.MixedVersionSteps(p.currentContext, p.prng, p.isLocal)...)
@@ -453,27 +492,61 @@ func (p *testPlanner) finalizeUpgradeSteps(
 ) []testStep {
 	p.currentContext.System.Finalizing = true
 	p.currentContext.System.Stage = RunningUpgradeMigrationsStage
-	runMigrations := p.newSingleStep(allowUpgradeStep{})
-	var mixedVersionStepsDuringMigrations []testStep
+	runSystemMigrations := p.newSingleStep(allowUpgradeStep{
+		virtualClusterName: install.SystemInterfaceName,
+	})
+
+	steps := []testStep{runSystemMigrations}
+
+	var mixedVersionStepsDuringTenantMigrations []testStep
 	if scheduleHooks {
-		mixedVersionStepsDuringMigrations = p.hooks.MixedVersionSteps(p.currentContext, p.prng, p.isLocal)
+		mixedVersionSteps := p.hooks.MixedVersionSteps(p.currentContext, p.prng, p.isLocal)
+
+		switch p.deploymentMode {
+		case NonUADeployment:
+			steps = append(steps, mixedVersionSteps...)
+
+		case UASharedProcessDeployment:
+			if len(mixedVersionSteps) > 0 {
+				idx := p.prng.Intn(len(mixedVersionSteps))
+
+				mixedVersionStepsDuringSystemMigrations := mixedVersionSteps[:idx]
+				steps = append(steps, mixedVersionStepsDuringSystemMigrations...)
+
+				mixedVersionStepsDuringTenantMigrations = mixedVersionSteps[idx:]
+			}
+		}
 	}
 
-	waitForMigrations := p.newSingleStep(
+	steps = append(steps, p.newSingleStep(
 		waitForStableClusterVersionStep{
-			nodes:              p.crdbNodes,
+			nodes:              p.currentContext.System.Descriptor.Nodes,
 			timeout:            p.options.upgradeTimeout,
 			desiredVersion:     versionToClusterVersion(toVersion),
 			virtualClusterName: install.SystemInterfaceName,
 		},
-	)
+	))
 
-	return append(
-		append(
-			[]testStep{runMigrations}, mixedVersionStepsDuringMigrations...,
-		),
-		waitForMigrations,
-	)
+	switch p.deploymentMode {
+	case UASharedProcessDeployment:
+		steps = append(steps, p.newSingleStep(
+			setTenantClusterVersionStep{
+				virtualClusterName: p.tenantName(),
+				nodes:              p.currentContext.Tenant.Descriptor.Nodes,
+				targetVersion:      versionToClusterVersion(toVersion),
+			},
+		))
+
+		steps = append(steps, mixedVersionStepsDuringTenantMigrations...)
+		steps = append(steps, p.newSingleStep(waitForStableClusterVersionStep{
+			nodes:              p.currentContext.Tenant.Descriptor.Nodes,
+			timeout:            p.options.upgradeTimeout,
+			desiredVersion:     versionToClusterVersion(toVersion),
+			virtualClusterName: p.currentContext.Tenant.Descriptor.Name,
+		}))
+	}
+
+	return steps
 }
 
 // shouldRollback returns whether the test will attempt a rollback. If
@@ -492,6 +565,19 @@ func (p *testPlanner) shouldRollback(toVersion *clusterupgrade.Version) bool {
 
 func (p *testPlanner) newSingleStep(impl singleStepProtocol) *singleStep {
 	return newSingleStep(p.currentContext, impl, p.newRNG())
+}
+
+func (p *testPlanner) services() []*ServiceDescriptor {
+	services := []*ServiceDescriptor{p.currentContext.System.Descriptor}
+	if p.currentContext.Tenant != nil {
+		services = append(services, p.currentContext.Tenant.Descriptor)
+	}
+
+	return services
+}
+
+func (p *testPlanner) tenantName() string {
+	return p.currentContext.Tenant.Descriptor.Name
 }
 
 func (p *testPlanner) clusterSettings() []install.ClusterSettingOption {
@@ -883,9 +969,17 @@ func (plan *TestPlan) assignIDs() {
 
 	plan.mapSingleSteps(func(ss *singleStep, _ bool) []testStep {
 		stepID := nextID()
-		if _, ok := ss.impl.(startStep); ok && plan.startClusterID == 0 {
-			plan.startClusterID = stepID
+		_, isStartSystem := ss.impl.(startStep)
+		_, isStartTenant := ss.impl.(startSharedProcessVirtualClusterStep)
+
+		if plan.startSystemID == 0 && isStartSystem {
+			plan.startSystemID = stepID
 		}
+
+		if plan.startTenantID == 0 && isStartTenant {
+			plan.startTenantID = stepID
+		}
+
 		ss.ID = stepID
 		return []testStep{ss}
 	})
@@ -1070,5 +1164,5 @@ func versionToClusterVersion(v *clusterupgrade.Version) string {
 	if v.IsCurrent() {
 		return clusterupgrade.CurrentVersionString
 	}
-	return fmt.Sprintf("'%d.%d'", v.Major(), v.Minor())
+	return fmt.Sprintf("%d.%d", v.Major(), v.Minor())
 }

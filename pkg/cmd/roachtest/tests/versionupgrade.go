@@ -126,7 +126,11 @@ func runVersionUpgrade(ctx context.Context, t test.Test, c cluster.Cluster) {
 			}
 
 			l.Printf("executing workload init on node %d", node)
-			return c.RunE(ctx, option.WithNodes(c.Node(node)), fmt.Sprintf("%s init schemachange {pgurl%s}", workloadPath, c.All()))
+			return c.RunE(
+				ctx,
+				option.WithNodes(c.Node(node)),
+				fmt.Sprintf("%s init schemachange %s", workloadPath, h.PGURL()),
+			)
 		})
 	mvt.InMixedVersion(
 		"run backup",
@@ -178,7 +182,7 @@ func runVersionUpgrade(ctx context.Context, t test.Test, c cluster.Cluster) {
 				Flag("verbose", 1).
 				Flag("max-ops", 10).
 				Flag("concurrency", 2).
-				Arg("{pgurl:1-%d}", len(c.All())).
+				Arg("%s", h.PGURL()).
 				String()
 
 			return c.RunE(ctx, option.WithNodes(c.Node(randomNode)), runCmd)

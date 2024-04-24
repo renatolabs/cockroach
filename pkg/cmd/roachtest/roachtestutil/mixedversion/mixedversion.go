@@ -100,6 +100,8 @@ const (
 	afterTestLabel    = "run after test hooks"
 	genericLabel      = "run following steps" // used by mutators to group steps
 
+	unreachable = "internal error: unreachable"
+
 	// runWhileMigratingProbability is the probability that a
 	// mixed-version hook will run after all nodes in the cluster have
 	// been upgraded to the same binary version, and the cluster version
@@ -127,7 +129,8 @@ const (
 
 	// These `*Deployment` constants are used to indicate different
 	// deployment modes that a test may choose to enable/disable.
-	NonUADeployment = DeploymentMode("non-ua")
+	NonUADeployment           = DeploymentMode("non-ua")
+	UASharedProcessDeployment = DeploymentMode("shared-process")
 )
 
 var (
@@ -153,6 +156,10 @@ var (
 	// requested a certain number of upgrades.
 	minSupportedARM64Version = clusterupgrade.MustParseVersion("v22.2.0")
 
+	allDeploymentModes = []DeploymentMode{
+		UASharedProcessDeployment,
+	}
+
 	defaultTestOptions = testOptions{
 		// We use fixtures more often than not as they are more likely to
 		// detect bugs, especially in migrations.
@@ -162,7 +169,7 @@ var (
 		maxUpgrades:                    4,
 		minimumSupportedVersion:        OldestSupportedVersion,
 		predecessorFunc:                randomPredecessorHistory,
-		enabledDeploymentModes:         []DeploymentMode{NonUADeployment},
+		enabledDeploymentModes:         allDeploymentModes,
 		overriddenMutatorProbabilities: make(map[string]float64),
 	}
 
@@ -613,7 +620,7 @@ func (t *Test) Run() {
 
 func (t *Test) run(plan *TestPlan) error {
 	return newTestRunner(
-		t.ctx, t.cancel, plan, t.logger, t.cluster, t.crdbNodes, t.seed,
+		t.ctx, t.cancel, plan, t.logger, t.cluster, t.seed,
 	).run()
 }
 
@@ -626,16 +633,16 @@ func (t *Test) plan() (*TestPlan, error) {
 	// Pick a random deployment mode to use in this test run among the
 	// list of enabled deployment modes enabled for this test.
 	deploymentMode := t.options.enabledDeploymentModes[t.prng.Intn(len(t.options.enabledDeploymentModes))]
+	tenantDescriptor := t.generateTenantDescriptor(deploymentMode)
 	initialRelease := previousReleases[0]
 
 	planner := testPlanner{
 		versions:       append(previousReleases, clusterupgrade.CurrentVersion()),
 		deploymentMode: deploymentMode,
-		currentContext: newInitialContext(initialRelease, t.crdbNodes, nil /* tenant */),
+		currentContext: newInitialContext(initialRelease, t.crdbNodes, tenantDescriptor),
 		options:        t.options,
 		rt:             t.rt,
 		isLocal:        t.isLocal(),
-		crdbNodes:      t.crdbNodes,
 		hooks:          t.hooks,
 		prng:           t.prng,
 		bgChans:        t.bgChans,
@@ -704,6 +711,21 @@ func (t *Test) numUpgrades() int {
 	return t.prng.Intn(
 		t.options.maxUpgrades-t.options.minUpgrades+1,
 	) + t.options.minUpgrades
+}
+
+func (t *Test) generateTenantDescriptor(deploymentMode DeploymentMode) *ServiceDescriptor {
+	switch deploymentMode {
+	case NonUADeployment:
+		return nil
+
+	case UASharedProcessDeployment:
+		return &ServiceDescriptor{
+			Name:  virtualClusterName(t.prng),
+			Nodes: t.crdbNodes,
+		}
+	}
+
+	panic(unreachable)
 }
 
 // latestPredecessorHistory is an implementation of `predecessorFunc`
@@ -914,6 +936,17 @@ func rngFromRNG(rng *rand.Rand) *rand.Rand {
 	return rand.New(rand.NewSource(rng.Int63()))
 }
 
+// virtualClusterName returns a random name that can be used as a
+// virtual cluster name in a test.
+func virtualClusterName(rng *rand.Rand) string {
+	return strings.ToLower(
+		fmt.Sprintf(
+			"mixed-version-tenant-%s",
+			randutil.RandString(rng, 5, randutil.PrintableKeyAlphabet),
+		),
+	)
+}
+
 func assertValidTest(test *Test, fatalFunc func(...interface{})) {
 	fail := func(err error) {
 		fatalFunc(errors.Wrap(err, "mixedversion.NewTest"))
@@ -956,5 +989,25 @@ func assertValidTest(test *Test, fatalFunc func(...interface{})) {
 
 	if len(test.options.enabledDeploymentModes) == 0 {
 		fail(fmt.Errorf("invalid test options: no deployment modes enabled"))
+	}
+
+	validDeploymentMode := func(mode DeploymentMode) bool {
+		for _, deploymentMode := range allDeploymentModes {
+			if mode == deploymentMode {
+				return true
+			}
+		}
+
+		return false
+	}
+
+	// Validate that every possible deployment mode for this test is
+	// valid (i.e., part of the `allDeploymentModes` list). This allows
+	// to avoid having to implement a `default` branch with an error
+	// when switching on deployment mode.
+	for _, dm := range test.options.enabledDeploymentModes {
+		if !validDeploymentMode(dm) {
+			fail(fmt.Errorf("invalid test options: unknown deployment mode %q", dm))
+		}
 	}
 }

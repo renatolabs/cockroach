@@ -83,7 +83,7 @@ func (m preserveDowngradeOptionRandomizerMutator) Generate(
 			// Note that we don't attempt a concurrent insert because the
 			// selected step could be one that restarts a cockroach node,
 			// and `allowUpgradeStep` could fail in that situation.
-			InsertBefore(allowUpgradeStep{})
+			InsertBefore(allowUpgradeStep{virtualClusterName: install.SystemInterfaceName})
 
 		// Finally, we update the context associated with every step where
 		// all nodes are running the next verison to indicate they are in
