@@ -12,6 +12,7 @@ package instancestorage
 
 import (
 	"context"
+	"runtime/debug"
 	"strings"
 	"sync"
 
@@ -114,7 +115,7 @@ func newRangeFeedCache(
 	) {
 		instance, err := rowCodec.decodeRow(keyVal.Key, &keyVal.Value)
 		if err != nil {
-			log.Ops.Warningf(ctx, "failed to decode settings row %v: %v", keyVal.Key, err)
+			log.Ops.Warningf(ctx, "failed to decode settings row %v: %v\n%s", keyVal.Key, err, string(debug.Stack()))
 			return
 		}
 		feed.updateInstanceMap(instance, !keyVal.Value.IsPresent())
