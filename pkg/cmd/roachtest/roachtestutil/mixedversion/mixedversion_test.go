@@ -11,12 +11,14 @@
 package mixedversion
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/roachtestutil/clusterupgrade"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
 	"github.com/stretchr/testify/require"
@@ -120,6 +122,28 @@ func Test_assertValidTest(t *testing.T) {
 	)
 
 	mvt = newTest(MinimumSupportedVersion("v22.2.0"))
+	assertValidTest(mvt, fatalFunc())
+	require.NoError(t, fatalErr)
+
+	// Attempting to use `CreateTenantFunc` with default deployment
+	// modes is an error.
+	mvt = newTest()
+	mvt.CreateTenantFunc(func(_ context.Context, _ *logger.Logger, _ *rand.Rand, _ *Helper, _ string) error {
+		return nil
+	})
+	assertValidTest(mvt, fatalFunc())
+	require.Error(t, fatalErr)
+	require.Equal(t,
+		`mixedversion.NewTest: invalid test options: CreateTenantFunc can only be used for shared-process deployments`,
+		fatalErr.Error(),
+	)
+
+	// It is valid to use `CreateTenantFunc` when restricting deployment
+	// to shared-process.
+	mvt = newTest(EnabledDeploymentModes(SharedProcessDeployment))
+	mvt.CreateTenantFunc(func(_ context.Context, _ *logger.Logger, _ *rand.Rand, _ *Helper, _ string) error {
+		return nil
+	})
 	assertValidTest(mvt, fatalFunc())
 	require.NoError(t, fatalErr)
 }

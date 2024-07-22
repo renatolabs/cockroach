@@ -1,0 +1,78 @@
+# Test that when the user passes a custom function to create the
+# tenant, that function is used instead of the default implementation.
+
+mixed-version-test deployment_mode=shared-process
+----
+ok
+
+create-tenant-func
+----
+ok
+
+in-mixed-version name=(mixed-version 1)
+----
+ok
+
+in-mixed-version name=(mixed-version 2)
+----
+ok
+
+workload name=bank
+----
+ok
+
+workload name=rand
+----
+ok
+
+background-command name=(csv server)
+----
+ok
+
+plan
+----
+Seed:               12345
+Upgrades:           v24.2.2 → <current>
+Deployment mode:    shared-process
+Plan:
+├── install fixtures for version "v24.2.2" (1)
+├── start cluster at version "v24.2.2" (2)
+├── wait for system tenant on nodes :1-4 to reach cluster version '24.2' (3)
+├── create tenant 'mixed-version-tenant-gg5cy' by invoking user-provided function (4)
+├── wait for mixed-version-tenant-gg5cy tenant on nodes :1-4 to reach cluster version '24.2' (5)
+├── set cluster setting "server.controller.default_target_cluster" to 'mixed-version-tenant-gg5cy' on system tenant (6)
+├── run startup hooks concurrently
+│   ├── run "initialize bank workload", after 0s delay (7)
+│   └── run "initialize rand workload", after 0s delay (8)
+├── start background hooks concurrently
+│   ├── run "bank workload", after 3m0s delay (9)
+│   ├── run "rand workload", after 0s delay (10)
+│   └── run "csv server", after 500ms delay (11)
+└── upgrade cluster from "v24.2.2" to "<current>"
+   ├── prevent auto-upgrades on system tenant by setting `preserve_downgrade_option` (12)
+   ├── prevent auto-upgrades on mixed-version-tenant-gg5cy tenant by setting `preserve_downgrade_option` (13)
+   ├── upgrade nodes :1-4 from "v24.2.2" to "<current>"
+   │   ├── restart node 3 with binary version <current> (14)
+   │   ├── run "mixed-version 2" (15)
+   │   ├── restart node 2 with binary version <current> (16)
+   │   ├── restart node 4 with binary version <current> (17)
+   │   ├── run "mixed-version 1" (18)
+   │   └── restart node 1 with binary version <current> (19)
+   ├── downgrade nodes :1-4 from "<current>" to "v24.2.2"
+   │   ├── restart node 1 with binary version v24.2.2 (20)
+   │   ├── run "mixed-version 1" (21)
+   │   ├── restart node 2 with binary version v24.2.2 (22)
+   │   ├── restart node 4 with binary version v24.2.2 (23)
+   │   └── restart node 3 with binary version v24.2.2 (24)
+   ├── upgrade nodes :1-4 from "v24.2.2" to "<current>"
+   │   ├── restart node 1 with binary version <current> (25)
+   │   ├── restart node 4 with binary version <current> (26)
+   │   ├── restart node 2 with binary version <current> (27)
+   │   ├── run "mixed-version 1" (28)
+   │   ├── restart node 3 with binary version <current> (29)
+   │   └── run "mixed-version 2" (30)
+   ├── allow upgrade to happen on system tenant by resetting `preserve_downgrade_option` (31)
+   ├── wait for system tenant on nodes :1-4 to reach cluster version <current> (32)
+   ├── allow upgrade to happen on mixed-version-tenant-gg5cy tenant by resetting `preserve_downgrade_option` (33)
+   ├── run "mixed-version 2" (34)
+   └── wait for mixed-version-tenant-gg5cy tenant on nodes :1-4 to reach cluster version <current> (35)

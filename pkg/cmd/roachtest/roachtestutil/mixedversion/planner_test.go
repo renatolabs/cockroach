@@ -130,6 +130,10 @@ func TestTestPlanner(t *testing.T) {
 				mvt.InMixedVersion(d.CmdArgs[0].Vals[0], dummyHook)
 			case "after-upgrade-finalized":
 				mvt.AfterUpgradeFinalized(d.CmdArgs[0].Vals[0], dummyHook)
+			case "create-tenant-func":
+				mvt.CreateTenantFunc(func(_ context.Context, _ *logger.Logger, _ *rand.Rand, _ *Helper, _ string) error {
+					return nil
+				})
 			case "workload":
 				initCmd := roachtestutil.NewCommand("./cockroach workload init some-workload")
 				runCmd := roachtestutil.NewCommand("./cockroach workload run some-workload")

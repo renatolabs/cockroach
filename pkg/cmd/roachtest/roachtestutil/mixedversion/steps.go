@@ -103,6 +103,25 @@ func (s startSharedProcessVirtualClusterStep) Run(
 	)
 }
 
+// customStartTenantStep runs the function provided by the user to
+// start the tenant used in this test.
+type customStartTenantStep struct {
+	fn   createTenantFunc
+	name string
+}
+
+func (s customStartTenantStep) Background() shouldStop { return nil }
+
+func (s customStartTenantStep) Description() string {
+	return fmt.Sprintf("create tenant '%s' by invoking user-provided function", s.name)
+}
+
+func (s customStartTenantStep) Run(
+	ctx context.Context, l *logger.Logger, rng *rand.Rand, h *Helper,
+) error {
+	return s.fn(ctx, l, rng, h, s.name)
+}
+
 // waitForStableClusterVersionStep implements the process of waiting
 // for the `version` cluster setting being the same on all nodes of
 // the cluster and equal to the binary version of the first node in

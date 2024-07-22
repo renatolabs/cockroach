@@ -491,10 +491,7 @@ func (p *testPlanner) tenantSetupSteps(v *clusterupgrade.Version) []testStep {
 	// set it as the default cluster, and give it all capabilities if
 	// necessary.
 	steps := []testStep{
-		p.newSingleStepWithContext(setupContext, startSharedProcessVirtualClusterStep{
-			name:     p.tenantName(),
-			settings: p.clusterSettingsForTenant(),
-		}),
+		p.newSingleStepWithContext(setupContext, p.startTenantStep()),
 		p.newSingleStepWithContext(setupContext, waitForStableClusterVersionStep{
 			nodes:              p.currentContext.Tenant.Descriptor.Nodes,
 			timeout:            p.options.upgradeTimeout,
@@ -527,6 +524,24 @@ func (p *testPlanner) tenantSetupSteps(v *clusterupgrade.Version) []testStep {
 	}
 
 	return steps
+}
+
+// startTenantStep returns the step implementation that should be used
+// when starting a tenant during the test. This is typically
+// `startSharedProcessVirtualClusterStep`, but could be a custom
+// function provided by the user.
+func (p *testPlanner) startTenantStep() singleStepProtocol {
+	if p.hooks.customCreateTenant != nil {
+		return customStartTenantStep{
+			name: p.tenantName(),
+			fn:   p.hooks.customCreateTenant,
+		}
+	}
+
+	return startSharedProcessVirtualClusterStep{
+		name:     p.tenantName(),
+		settings: p.clusterSettingsForTenant(),
+	}
 }
 
 // startupSteps returns the list of steps that should be executed once

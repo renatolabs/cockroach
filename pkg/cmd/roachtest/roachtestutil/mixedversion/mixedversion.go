@@ -229,6 +229,10 @@ type (
 	stepFunc      func(context.Context, *logger.Logger, *rand.Rand, *Helper) error
 	predicateFunc func(Context) bool
 
+	// createTenantFunc is very similar to `stepFunc`, but also takes
+	// the name of the tenant to be created as an argument.
+	createTenantFunc func(context.Context, *logger.Logger, *rand.Rand, *Helper, string) error
+
 	// versionUpgradeHook is a hook that can be called at any time
 	// during an upgrade/downgrade process. The `predicate` is used
 	// during test planning to determine when it is called: currently,
@@ -286,7 +290,11 @@ type (
 		background            hooks
 		mixedVersion          hooks
 		afterUpgradeFinalized hooks
-		crdbNodes             option.NodeListOption
+		// customCreateTenant is used for tests that need add special
+		// logic to the process of creating a (shared-process) tenant to
+		// be used during this test.
+		customCreateTenant createTenantFunc
+		crdbNodes          option.NodeListOption
 	}
 
 	// testOptions contains some options that can be changed by the user
@@ -597,6 +605,22 @@ func (t *Test) OnStartup(desc string, fn stepFunc) {
 	// of the planner, there is no need to have a predicate function
 	// gating them.
 	t.hooks.AddStartup(versionUpgradeHook{name: desc, fn: fn})
+}
+
+// CreateTenantFunc allows tests to customize how the tenant created
+// for the purposes of this test is created/initialized. The function
+// passed as parameter is expected to create a tenant with the given
+// name; when the function returns, the tenant should be ready to
+// handle requests. Currently, this functionality is only available in
+// very specific circumstances:
+//
+// 1. Only for shared-process deployments
+// 2. Only for tests that can only run in shared-process deployments
+//
+// We can consider expanding this functionality for other use-cases
+// once we learn more about the requirements.
+func (t *Test) CreateTenantFunc(fn createTenantFunc) {
+	t.hooks.customCreateTenant = fn
 }
 
 // AfterUpgradeFinalized registers a callback that is run once the
@@ -1141,5 +1165,13 @@ func assertValidTest(test *Test, fatalFunc func(...interface{})) {
 		if !validDeploymentMode(dm) {
 			fail(fmt.Errorf("invalid test options: unknown deployment mode %q", dm))
 		}
+	}
+
+	// We limit the use of a custom tenant creation function for
+	// shared-process deployment tests.
+	isOnlySharedProcess := len(test.options.enabledDeploymentModes) == 1 &&
+		test.options.enabledDeploymentModes[0] == SharedProcessDeployment
+	if test.hooks.customCreateTenant != nil && !isOnlySharedProcess {
+		fail(fmt.Errorf("invalid test options: CreateTenantFunc can only be used for shared-process deployments"))
 	}
 }
