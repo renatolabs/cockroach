@@ -47,9 +47,10 @@ func (s installFixturesStep) Run(
 // startStep is the step that starts the cluster from a specific
 // `version`.
 type startStep struct {
-	rt       test.Test
-	version  *clusterupgrade.Version
-	settings []install.ClusterSettingOption
+	rt         test.Test
+	version    *clusterupgrade.Version
+	initTarget int
+	settings   []install.ClusterSettingOption
 }
 
 func (s startStep) Background() shouldStop { return nil }
@@ -73,8 +74,10 @@ func (s startStep) Run(ctx context.Context, l *logger.Logger, _ *rand.Rand, h *H
 		append([]install.ClusterSettingOption{}, s.settings...),
 		install.BinaryOption(binaryPath),
 	)
+
+	opts := startOpts(option.WithInitTarget(s.initTarget))
 	return clusterupgrade.StartWithSettings(
-		ctx, l, h.runner.cluster, systemNodes, startOpts(), clusterSettings...,
+		ctx, l, h.runner.cluster, systemNodes, opts, clusterSettings...,
 	)
 }
 
@@ -82,8 +85,9 @@ func (s startStep) Run(ctx context.Context, l *logger.Logger, _ *rand.Rand, h *H
 // virtual cluster with the given name, and starts it. At the end of
 // this step, the virtual cluster should be ready to receive requests.
 type startSharedProcessVirtualClusterStep struct {
-	name     string
-	settings []install.ClusterSettingOption
+	name       string
+	initTarget int
+	settings   []install.ClusterSettingOption
 }
 
 func (s startSharedProcessVirtualClusterStep) Background() shouldStop { return nil }
@@ -96,7 +100,7 @@ func (s startSharedProcessVirtualClusterStep) Run(
 	ctx context.Context, l *logger.Logger, _ *rand.Rand, h *Helper,
 ) error {
 	l.Printf("starting shared process virtual cluster %s", s.name)
-	startOpts := option.StartSharedVirtualClusterOpts(s.name)
+	startOpts := option.StartSharedVirtualClusterOpts(s.name, option.WithInitTarget(s.initTarget))
 
 	return h.runner.cluster.StartServiceForVirtualClusterE(
 		ctx, l, startOpts, install.MakeClusterSettings(s.settings...),
@@ -459,6 +463,8 @@ func quoteVersionForPresentation(v string) string {
 // scheduled backup may make things non-deterministic. In the future,
 // we should change the default and add an API for tests to opt-out of
 // the default scheduled backup if necessary.
-func startOpts() option.StartOpts {
-	return option.NewStartOpts(option.NoBackupSchedule)
+func startOpts(opts ...option.StartStopOption) option.StartOpts {
+	return option.NewStartOpts(
+		append([]option.StartStopOption{option.NoBackupSchedule}, opts...)...,
+	)
 }

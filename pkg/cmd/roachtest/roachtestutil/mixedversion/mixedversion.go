@@ -75,6 +75,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -309,6 +310,7 @@ type (
 		skipVersionProbability         float64
 		settings                       []install.ClusterSettingOption
 		enabledDeploymentModes         []DeploymentMode
+		tag                            string
 		overriddenMutatorProbabilities map[string]float64
 	}
 
@@ -475,6 +477,12 @@ func DisableMutators(names ...string) CustomOption {
 	}
 }
 
+func WithTag(tag string) CustomOption {
+	return func(opts *testOptions) {
+		opts.tag = tag
+	}
+}
+
 // minSupportedSkipVersionUpgrade is the minimum version after which
 // "skip version" upgrades are supported (i.e., upgrading two major
 // releases in a single upgrade).
@@ -523,14 +531,14 @@ func NewTest(
 	crdbNodes option.NodeListOption,
 	options ...CustomOption,
 ) *Test {
-	testLogger, err := prefixedLogger(l, logPrefix)
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	opts := defaultTestOptions()
 	for _, fn := range options {
 		fn(&opts)
+	}
+
+	testLogger, err := prefixedLogger(l, filepath.Join(opts.tag, logPrefix))
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	prng, seed := randutil.NewLockedPseudoRand()
@@ -707,7 +715,7 @@ func (t *Test) Run() {
 }
 
 func (t *Test) run(plan *TestPlan) error {
-	return newTestRunner(t.ctx, t.cancel, plan, t.logger, t.cluster).run()
+	return newTestRunner(t.ctx, t.cancel, plan, t.options.tag, t.logger, t.cluster).run()
 }
 
 func (t *Test) plan() (*TestPlan, error) {

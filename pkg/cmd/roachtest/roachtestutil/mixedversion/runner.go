@@ -100,7 +100,7 @@ type (
 
 		connCache struct {
 			mu    syncutil.Mutex
-			cache []*gosql.DB
+			cache map[int]*gosql.DB
 		}
 	}
 
@@ -108,6 +108,7 @@ type (
 		ctx           context.Context
 		cancel        context.CancelFunc
 		plan          *TestPlan
+		tag           string
 		cluster       cluster.Cluster
 		systemService *serviceRuntime
 		tenantService *serviceRuntime
@@ -147,6 +148,7 @@ func newTestRunner(
 	ctx context.Context,
 	cancel context.CancelFunc,
 	plan *TestPlan,
+	tag string,
 	l *logger.Logger,
 	c cluster.Cluster,
 ) *testRunner {
@@ -171,6 +173,7 @@ func newTestRunner(
 		ctx:           ctx,
 		cancel:        cancel,
 		plan:          plan,
+		tag:           tag,
 		logger:        l,
 		systemService: systemService,
 		tenantService: tenantService,
@@ -490,7 +493,7 @@ func (tr *testRunner) logVersions(l *logger.Logger, testContext Context) {
 		return
 	}
 
-	tw := newTableWriter(len(releasedVersions))
+	tw := newTableWriter(testContext.System.Descriptor.Nodes)
 	tw.AddRow("released versions", toString(releasedVersions)...)
 	tw.AddRow("logical binary versions", toString(binaryVersions)...)
 
@@ -513,7 +516,7 @@ func (tr *testRunner) loggerFor(step *singleStep) (*logger.Logger, error) {
 	name := invalidChars.ReplaceAllString(strings.ToLower(step.impl.Description()), "")
 	name = fmt.Sprintf("%d_%s", step.ID, name)
 
-	prefix := path.Join(logPrefix, name)
+	prefix := path.Join(tr.tag, logPrefix, name)
 	return prefixedLogger(tr.logger, prefix)
 }
 
@@ -587,7 +590,7 @@ func (tr *testRunner) maybeInitConnections(service *serviceRuntime) error {
 		return nil
 	}
 
-	cc := make([]*gosql.DB, len(service.descriptor.Nodes))
+	cc := map[int]*gosql.DB{}
 	for _, node := range service.descriptor.Nodes {
 		conn, err := tr.cluster.ConnE(
 			tr.ctx, tr.logger, node, option.VirtualClusterName(service.descriptor.Name),
@@ -596,7 +599,7 @@ func (tr *testRunner) maybeInitConnections(service *serviceRuntime) error {
 			return fmt.Errorf("failed to connect to node %d: %w", node, err)
 		}
 
-		cc[node-1] = conn
+		cc[node] = conn
 	}
 
 	service.connCache.cache = cc
@@ -662,7 +665,7 @@ func (tr *testRunner) conn(node int, virtualClusterName string) *gosql.DB {
 
 	service.connCache.mu.Lock()
 	defer service.connCache.mu.Unlock()
-	return service.connCache.cache[node-1]
+	return service.connCache.cache[node]
 }
 
 func (tr *testRunner) closeConnections() {
@@ -814,8 +817,7 @@ func (tfd *testFailureDetails) Format() string {
 		fmt.Sprintf("test random seed: %d\n", tfd.seed),
 	}
 
-	numNodes := len(tfd.systemService.descriptor.Nodes)
-	tw := newTableWriter(numNodes)
+	tw := newTableWriter(tfd.systemService.descriptor.Nodes)
 	if tfd.testContext != nil {
 		releasedVersions := make([]*clusterupgrade.Version, 0, len(tfd.testContext.System.Descriptor.Nodes))
 		for _, node := range tfd.testContext.System.Descriptor.Nodes {
@@ -858,8 +860,8 @@ type tableWriter struct {
 }
 
 // newTableWriter creates a tableWriter to display tabular data for
-// the given number of nodes.
-func newTableWriter(numNodes int) *tableWriter {
+// the nodes passed as parameter.
+func newTableWriter(nodes option.NodeListOption) *tableWriter {
 	var buffer bytes.Buffer
 	const (
 		minWidth = 3
@@ -873,8 +875,8 @@ func newTableWriter(numNodes int) *tableWriter {
 	writer := &tableWriter{buffer: &buffer, w: tw}
 
 	var nodeValues []string
-	for j := 1; j <= numNodes; j++ {
-		nodeValues = append(nodeValues, fmt.Sprintf("n%d", j))
+	for _, n := range nodes {
+		nodeValues = append(nodeValues, fmt.Sprintf("n%d", n))
 	}
 
 	writer.AddRow("", nodeValues...)

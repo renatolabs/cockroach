@@ -465,9 +465,10 @@ func (p *testPlanner) systemSetupSteps() []testStep {
 	setupContext := p.nonUpgradeContext(initialVersion, SystemSetupStage)
 	return append(steps,
 		p.newSingleStepWithContext(setupContext, startStep{
-			version:  initialVersion,
-			rt:       p.rt,
-			settings: p.clusterSettingsForSystem(),
+			version:    initialVersion,
+			rt:         p.rt,
+			initTarget: p.currentContext.System.Descriptor.Nodes[0],
+			settings:   p.clusterSettingsForSystem(),
 		}),
 		p.newSingleStepWithContext(setupContext, waitForStableClusterVersionStep{
 			nodes:              p.currentContext.System.Descriptor.Nodes,
@@ -539,8 +540,9 @@ func (p *testPlanner) startTenantStep() singleStepProtocol {
 	}
 
 	return startSharedProcessVirtualClusterStep{
-		name:     p.tenantName(),
-		settings: p.clusterSettingsForTenant(),
+		name:       p.tenantName(),
+		initTarget: p.currentContext.Tenant.Descriptor.Nodes[0],
+		settings:   p.clusterSettingsForTenant(),
 	}
 }
 
@@ -1260,7 +1262,9 @@ func (plan *TestPlan) assignIDs() {
 	plan.mapSingleSteps(func(ss *singleStep, _ bool) []testStep {
 		stepID := nextID()
 		_, isStartSystem := ss.impl.(startStep)
-		_, isStartTenant := ss.impl.(startSharedProcessVirtualClusterStep)
+		_, isStartSharedProcess := ss.impl.(startSharedProcessVirtualClusterStep)
+		_, isStartCustom := ss.impl.(customStartTenantStep)
+		isStartTenant := isStartSharedProcess || isStartCustom
 
 		if plan.startSystemID == 0 && isStartSystem {
 			plan.startSystemID = stepID
