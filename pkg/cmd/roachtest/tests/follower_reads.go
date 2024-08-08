@@ -791,7 +791,9 @@ func verifyHighFollowerReadRatios(
 		adminNode = i
 		break
 	}
-	adminURLs, err := c.ExternalAdminUIAddr(ctx, l, c.Node(adminNode))
+	adminURLs, err := c.ExternalAdminUIAddr(
+		ctx, l, c.Node(adminNode), option.VirtualClusterName(install.SystemInterfaceName),
+	)
 	require.NoError(t, err)
 
 	url := "https://" + adminURLs[0] + "/ts/query"
@@ -902,7 +904,9 @@ func getFollowerReadCounts(ctx context.Context, t test.Test, c cluster.Cluster) 
 	followerReadCounts := make([]int, c.Spec().NodeCount)
 	getFollowerReadCount := func(ctx context.Context, node int) func() error {
 		return func() error {
-			adminUIAddrs, err := c.ExternalAdminUIAddr(ctx, t.L(), c.Node(node))
+			adminUIAddrs, err := c.ExternalAdminUIAddr(
+				ctx, t.L(), c.Node(node), option.VirtualClusterName(install.SystemInterfaceName),
+			)
 			if err != nil {
 				return err
 			}

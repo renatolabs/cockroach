@@ -174,6 +174,15 @@ func SkipInit(opts interface{}) {
 	}
 }
 
+func Tag(tag string) func(opts interface{}) {
+	return func(opts interface{}) {
+		switch opts := opts.(type) {
+		case *StopOpts:
+			opts.RoachprodOpts.ProcessTag = tag
+		}
+	}
+}
+
 // WithInitTarget allows the caller to configure which node is used as
 // `InitTarget` when starting cockroach. Specially useful when
 // starting clusters in a subset of VMs in the cluster that doesn't

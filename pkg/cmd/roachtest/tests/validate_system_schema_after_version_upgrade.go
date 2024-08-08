@@ -118,6 +118,7 @@ func runValidateSystemSchemaAfterVersionUpgrade(
 
 	systemComparison := newTenantSystemSchemaComparison(install.SystemInterfaceName)
 	var tenantComparison *tenantSystemSchemaComparison
+	var deploymentMode mixedversion.DeploymentMode
 
 	mvt := mixedversion.NewTest(ctx, t, t.L(), c, c.All(),
 		// We limit the number of upgrades since the test is not expected to work
@@ -135,6 +136,7 @@ func runValidateSystemSchemaAfterVersionUpgrade(
 				return nil
 			}
 
+			deploymentMode = h.DeploymentMode()
 			systemComparison.upgraded = obtainSystemSchema(ctx, l, c, 1, systemComparison.name)
 			if h.IsMultitenant() {
 				tenantComparison = newTenantSystemSchemaComparison(h.Tenant.Descriptor.Name)
@@ -157,8 +159,21 @@ func runValidateSystemSchemaAfterVersionUpgrade(
 	validateTenant := tenantComparison != nil && clusterupgrade.CurrentVersion().AtLeast(validateSystemSchemaTenantVersion)
 
 	if validateTenant {
-		t.L().Printf("creating shared-process tenant")
-		startOpts := option.StartSharedVirtualClusterOpts(tenantComparison.name)
+		var startOpts option.StartOpts
+
+		switch deploymentMode {
+		case mixedversion.SharedProcessDeployment:
+			t.L().Printf("creating shared-process tenant")
+			startOpts = option.StartSharedVirtualClusterOpts(tenantComparison.name)
+
+		case mixedversion.SeparateProcessDeployment:
+			t.L().Printf("creating separate-process tenant")
+			startOpts = option.StartVirtualClusterOpts(tenantComparison.name, c.Node(1))
+
+		default:
+			t.Fatal(fmt.Errorf("programming error: unexpected deployment mode %q", deploymentMode))
+		}
+
 		c.StartServiceForVirtualCluster(ctx, t.L(), startOpts, settings)
 		tenantComparison.bootstrapped = obtainSystemSchema(ctx, t.L(), c, 1, tenantComparison.name)
 	}
