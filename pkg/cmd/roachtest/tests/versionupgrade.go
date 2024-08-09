@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/release"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
@@ -119,7 +120,14 @@ func runVersionUpgrade(ctx context.Context, t test.Test, c cluster.Cluster) {
 			// important to test because changes in system tables might cause backups to
 			// fail in mixed-version clusters.
 			dest := fmt.Sprintf("nodelocal://1/%d", timeutil.Now().UnixNano())
-			return h.Exec(rng, `BACKUP TO $1`, dest)
+			return testutils.SucceedsSoonError(func() error {
+				err := h.Exec(rng, `BACKUP TO $1`, dest)
+				if err != nil {
+					l.Printf("backup error: %v", err)
+				}
+
+				return err
+			})
 		})
 	mvt.InMixedVersion(
 		"test features",

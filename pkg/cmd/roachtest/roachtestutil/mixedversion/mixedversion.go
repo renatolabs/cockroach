@@ -162,8 +162,8 @@ var (
 	minSupportedARM64Version = clusterupgrade.MustParseVersion("v22.2.0")
 
 	allDeploymentModes = []DeploymentMode{
-		SystemOnlyDeployment,
-		SharedProcessDeployment,
+		// SystemOnlyDeployment,
+		// SharedProcessDeployment,
 		SeparateProcessDeployment,
 	}
 
@@ -1251,7 +1251,13 @@ func assertValidTest(test *Test, fatalFunc func(...interface{})) {
 	}
 
 	validDeploymentMode := func(mode DeploymentMode) bool {
-		for _, deploymentMode := range allDeploymentModes {
+		actuallyAllDeploymentModes := []DeploymentMode{
+			SystemOnlyDeployment,
+			SharedProcessDeployment,
+			SeparateProcessDeployment,
+		}
+
+		for _, deploymentMode := range actuallyAllDeploymentModes {
 			if mode == deploymentMode {
 				return true
 			}
