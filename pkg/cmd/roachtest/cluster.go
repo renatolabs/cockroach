@@ -665,6 +665,10 @@ type clusterImpl struct {
 		seed *int64
 	}
 
+	// defaultVirtualCluster, when set, changes the default virtual
+	// cluster tests connect to by default.
+	defaultVirtualCluster string
+
 	// destroyState contains state related to the cluster's destruction.
 	destroyState destroyState
 
@@ -2285,6 +2289,10 @@ func (c *clusterImpl) RefetchCertsFromNode(ctx context.Context, node int) error 
 	})
 }
 
+func (c *clusterImpl) SetDefaultVirtualCluster(name string) {
+	c.defaultVirtualCluster = name
+}
+
 // SetRandomSeed sets the random seed to be used by the cluster. If
 // not called, clusters generate a random seed from the global
 // generator in the `rand` package. This function must be called
@@ -2458,9 +2466,12 @@ func (c *clusterImpl) RunE(ctx context.Context, options install.RunOptions, args
 		c.f.L().Printf("details in %s.log", logFile)
 	}
 	l.Printf("> %s", cmd)
+	expanderCfg := install.ExpanderConfig{
+		DefaultVirtualCluster: c.defaultVirtualCluster,
+	}
 	if err := roachprod.Run(
 		ctx, l, c.MakeNodes(nodes), "", "", c.IsSecure(),
-		l.Stdout, l.Stderr, args, options,
+		l.Stdout, l.Stderr, args, options.WithExpanderConfig(expanderCfg),
 	); err != nil {
 		if err := ctx.Err(); err != nil {
 			l.Printf("(note: incoming context was canceled: %s)", err)
@@ -2630,6 +2641,9 @@ func (c *clusterImpl) pgURLErr(
 	certsDir := install.CockroachNodeCertsDir
 	if opts.External {
 		certsDir = c.localCertsDir
+	}
+	if opts.VirtualClusterName == "" {
+		opts.VirtualClusterName = c.defaultVirtualCluster
 	}
 	urls, err := roachprod.PgURL(ctx, l, c.MakeNodes(nodes), certsDir, opts)
 	if err != nil {
