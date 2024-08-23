@@ -31,7 +31,14 @@ import (
 const gceDiskStartupScriptTemplate = `#!/usr/bin/env bash
 # Script for setting up a GCE machine for roachprod use.
 
-set -x
+# ensure any failure fails the entire script
+set -eux
+
+# Log the startup of the script with a timestamp
+echo "startup script starting: $(date -u)" | tee -a {{ .StartupLogs }}
+
+# Redirect output to stdout/err and a log file
+exec &> >(tee -a {{ .StartupLogs }})
 
 function setup_disks() {
   first_setup=$1
@@ -298,6 +305,7 @@ func writeStartupScript(
 		EnableCron           bool
 		OSInitializedFile    string
 		DisksInitializedFile string
+		StartupLogs          string
 	}
 
 	publicKey, err := config.SSHPublicKey()
@@ -315,6 +323,7 @@ func writeStartupScript(
 		EnableCron:           enableCron,
 		OSInitializedFile:    vm.OSInitializedFile,
 		DisksInitializedFile: vm.DisksInitializedFile,
+		StartupLogs:          vm.StartupLogs,
 	}
 
 	tmpfile, err := os.CreateTemp("", "gce-startup-script")

@@ -1420,7 +1420,16 @@ func (c *SyncedCluster) Wait(ctx context.Context, l *logger.Logger) error {
 				return res, nil
 			}
 			res.Err = errors.Wrapf(res.Err, "timed out after 5m")
+			logContent, err := c.runCmdOnSingleNode(ctx, nil, node, fmt.Sprintf("tail -n %d %s", 20, vm.StartupLogs), cmdOptsWithDebugDisabled())
+			if err != nil {
+				res.Err = errors.CombineErrors(res.Err, err)
+			} else if logContent.Err != nil {
+				res.Err = errors.CombineErrors(res.Err, logContent.Err)
+			} else {
+				res.Err = errors.Wrapf(res.Err, "last 20 lines of log:\n%s", logContent.Stdout)
+			}
 			l.Printf("  %2d: %v", node, res.Err)
+			l.Printf("  %2d: view the full log in %s", node, vm.StartupLogs)
 			return res, nil
 		})
 

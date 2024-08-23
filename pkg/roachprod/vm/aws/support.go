@@ -35,7 +35,14 @@ import (
 const awsStartupScriptTemplate = `#!/usr/bin/env bash
 # Script for setting up a AWS machine for roachprod use.
 
-set -x
+# ensure any failure fails the entire script
+set -eux
+
+# Log the startup of the script with a timestamp
+echo "startup script starting: $(date -u)" | tee -a {{ .StartupLogs }}
+
+# Redirect output to stdout/err and a log file
+exec &> >(tee -a {{ .StartupLogs }})
 
 if [ -e {{ .DisksInitializedFile }} ]; then
   echo "Already initialized, exiting."
@@ -255,6 +262,7 @@ func writeStartupScript(
 		Zfs                  bool
 		EnableFIPS           bool
 		DisksInitializedFile string
+		StartupLogs          string
 	}
 
 	args := tmplParams{
@@ -264,6 +272,7 @@ func writeStartupScript(
 		Zfs:                  fileSystem == vm.Zfs,
 		EnableFIPS:           enableFips,
 		DisksInitializedFile: vm.DisksInitializedFile,
+		StartupLogs:          vm.StartupLogs,
 	}
 
 	tmpfile, err := os.CreateTemp("", "aws-startup-script")
