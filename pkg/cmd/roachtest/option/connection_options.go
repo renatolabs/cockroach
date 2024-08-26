@@ -17,6 +17,19 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 )
 
+type userOption[T any] interface {
+	Get() T
+}
+
+type virtualClusterOptions struct {
+	Name     string
+	Instance int
+}
+
+func VirtualCluster[T any](name string) userOption[T] {
+	return
+}
+
 type ConnOption struct {
 	User               string
 	DBName             string
