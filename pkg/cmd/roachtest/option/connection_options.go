@@ -12,76 +12,85 @@ package option
 
 import (
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 )
 
-type userOption[T any] interface {
-	Get() T
+type CustomOption struct {
+	name  string
+	value any
 }
 
-type virtualClusterOptions struct {
-	Name     string
-	Instance int
+func User(user string) CustomOption {
+	return CustomOption{"User", user}
 }
 
-func VirtualCluster[T any](name string) userOption[T] {
-	return
+func VirtualClusterName(name string) CustomOption {
+	return CustomOption{"VirtualClusterName", name}
 }
 
-type ConnOption struct {
-	User               string
-	DBName             string
-	VirtualClusterName string
-	SQLInstance        int
-	AuthMode           install.PGAuthMode
-	Options            map[string]string
+func SQLInstance(sqlInstance int) CustomOption {
+	return CustomOption{"SQLInstance", sqlInstance}
 }
 
-func User(user string) func(*ConnOption) {
-	return func(option *ConnOption) {
-		option.User = user
-	}
+func ConnectionOption(key, value string) CustomOption {
+	return CustomOption{"ConnectionOption", map[string]string{key: value}}
 }
 
-func VirtualClusterName(name string) func(*ConnOption) {
-	return func(option *ConnOption) {
-		option.VirtualClusterName = name
-	}
-}
-
-func SQLInstance(sqlInstance int) func(*ConnOption) {
-	return func(option *ConnOption) {
-		option.SQLInstance = sqlInstance
-	}
-}
-
-func ConnectionOption(key, value string) func(*ConnOption) {
-	return func(option *ConnOption) {
-		if len(option.Options) == 0 {
-			option.Options = make(map[string]string)
-		}
-		option.Options[key] = value
-	}
-}
-
-func ConnectTimeout(t time.Duration) func(*ConnOption) {
+func ConnectTimeout(t time.Duration) CustomOption {
 	sec := int64(t.Seconds())
 	if sec < 1 {
 		sec = 1
 	}
-	return ConnectionOption("connect_timeout", fmt.Sprintf("%d", sec))
+	return CustomOption{"ConnectTimeout", sec}
 }
 
-func DBName(dbName string) func(*ConnOption) {
-	return func(option *ConnOption) {
-		option.DBName = dbName
-	}
+func DBName(dbName string) CustomOption {
+	return CustomOption{"DBName", dbName}
 }
 
-func AuthMode(authMode install.PGAuthMode) func(*ConnOption) {
-	return func(option *ConnOption) {
-		option.AuthMode = authMode
+func AuthMode(authMode install.PGAuthMode) CustomOption {
+	return CustomOption{"AuthMode", authMode}
+}
+
+func Apply(container any, opts []CustomOption) (retErr error) {
+	s := reflect.ValueOf(container)
+
+	var currentField string
+	defer func() {
+		if r := recover(); r != nil {
+			if currentField == "" {
+				retErr = fmt.Errorf("option.Apply failed: %v", r)
+			} else {
+				retErr = fmt.Errorf("failed to set %q on %T: %v", currentField, container, r)
+			}
+		}
+	}()
+
+	for _, opt := range opts {
+		currentField = opt.name
+		f := s.Elem().FieldByName(currentField)
+		if !f.IsValid() {
+			return fmt.Errorf("invalid option %s for %T", opt.name, container)
+		}
+
+		f.Set(reflect.ValueOf(opt.value))
 	}
+
+	return nil
+}
+
+type VirtualClusterOptions struct {
+	VirtualClusterName string
+	SQLInstance        int
+}
+
+type ConnOptions struct {
+	VirtualClusterOptions
+	User     string
+	DBName   string
+	AuthMode install.PGAuthMode
+	Options  map[string]string
 }

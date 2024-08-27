@@ -115,6 +115,14 @@ func runVersionUpgrade(ctx context.Context, t test.Test, c cluster.Cluster) {
 	mvt.InMixedVersion(
 		"run backup",
 		func(ctx context.Context, l *logger.Logger, rng *rand.Rand, h *mixedversion.Helper) error {
+			if true {
+				addrs, err := c.ExternalAdminUIAddr(ctx, l, c.Node(1), option.DBName("invalid"))
+				if err != nil {
+					return err
+				}
+
+				l.Printf("admin addr: %s", addrs[0])
+			}
 			// Verify that backups can be created in various configurations. This is
 			// important to test because changes in system tables might cause backups to
 			// fail in mixed-version clusters.
