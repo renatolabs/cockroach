@@ -106,8 +106,12 @@ func registerRebalanceLoad(r registry.Registry) {
 				})
 			mvt.InMixedVersion("rebalance load run",
 				func(ctx context.Context, l *logger.Logger, r *rand.Rand, h *mixedversion.Helper) error {
+					virtualCluster := install.SystemInterfaceName
+					if h.IsMultitenant() {
+						virtualCluster = h.Tenant.Descriptor.Name
+					}
 					return rebalanceByLoad(
-						ctx, t, l, c, rebalanceMode, maxDuration, concurrency, appNode, numStores, numNodes)
+						ctx, t, l, c, virtualCluster, rebalanceMode, maxDuration, concurrency, appNode, numStores, numNodes)
 				})
 			mvt.Run()
 		} else {
@@ -124,8 +128,8 @@ func registerRebalanceLoad(r registry.Registry) {
 			settings.ClusterSettings["server.cpu_profile.cpu_usage_combined_threshold"] = "90"
 			c.Start(ctx, t.L(), startOpts, settings, roachNodes)
 			require.NoError(t, rebalanceByLoad(
-				ctx, t, t.L(), c, rebalanceMode, maxDuration,
-				concurrency, appNode, numStores, numNodes,
+				ctx, t, t.L(), c, install.SystemInterfaceName, rebalanceMode,
+				maxDuration, concurrency, appNode, numStores, numNodes,
 			))
 		}
 
@@ -235,6 +239,7 @@ func rebalanceByLoad(
 	t test.Test,
 	l *logger.Logger,
 	c cluster.Cluster,
+	virtualCluster string,
 	rebalanceMode string,
 	maxDuration time.Duration,
 	concurrency int,
@@ -280,7 +285,7 @@ func rebalanceByLoad(
 	m.Go(func() error {
 		l.Printf("checking for CPU balance")
 
-		storeCPUFn, err := makeStoreCPUFn(ctx, t, l, c, numNodes, numStores)
+		storeCPUFn, err := makeStoreCPUFn(ctx, t, l, c, virtualCluster, numNodes, numStores)
 		if err != nil {
 			return err
 		}
@@ -325,9 +330,11 @@ func rebalanceByLoad(
 // the cluster stores. When there are multiple stores per node, stores on the
 // same node will report identical CPU.
 func makeStoreCPUFn(
-	ctx context.Context, t test.Test, l *logger.Logger, c cluster.Cluster, numNodes, numStores int,
+	ctx context.Context, t test.Test, l *logger.Logger, c cluster.Cluster, virtualCluster string, numNodes, numStores int,
 ) (func(ctx context.Context) ([]float64, error), error) {
-	adminURLs, err := c.ExternalAdminUIAddr(ctx, l, c.Node(1))
+	adminURLs, err := c.ExternalAdminUIAddr(
+		ctx, l, c.Node(1), option.VirtualClusterName(virtualCluster),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -345,7 +352,7 @@ func makeStoreCPUFn(
 	return func(ctx context.Context) ([]float64, error) {
 		now := timeutil.Now()
 		resp, err := getMetricsWithSamplePeriod(
-			ctx, c, t, url, install.SystemInterfaceName, startTime, now, statSamplePeriod, tsQueries)
+			ctx, c, t, url, virtualCluster, startTime, now, statSamplePeriod, tsQueries)
 		if err != nil {
 			return nil, err
 		}
