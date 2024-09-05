@@ -491,6 +491,12 @@ func (p *testPlanner) setupTest() (testSetup, []*upgradePlan) {
 
 	var tenantSetup *serviceSetup
 	if p.isMultitenant() {
+		for _, n := range p.currentContext.Tenant.Descriptor.Nodes {
+			handleInternalError(
+				p.currentContext.Tenant.changeVersion(n, tenantBootstrapVersion),
+			)
+		}
+
 		tenantSetup = &serviceSetup{
 			steps:    p.tenantSetupSteps(tenantBootstrapVersion),
 			upgrades: upgradesAfterTenantSetup,
