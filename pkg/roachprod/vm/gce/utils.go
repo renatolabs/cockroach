@@ -47,7 +47,7 @@ function setup_disks() {
 	mount_opts="defaults,nofail"
 	{{if .ExtraMountOpts}}mount_opts="${mount_opts},{{.ExtraMountOpts}}"{{end}}
 	{{ end }}
-	
+
 	use_multiple_disks='{{if .UseMultipleDisks}}true{{end}}'
 
 	mount_prefix="/mnt/data"
@@ -80,14 +80,19 @@ function setup_disks() {
 
 	for l in ${local_or_persistent}; do
   d=$(readlink -f $l)
+  mounted="no"
   {{ if .Zfs }}
     # Check if the disk is already part of a zpool or mounted; skip if so.
-    (zpool list -v -P | grep ${d} > /dev/null) || (mount | grep ${d} > /dev/null)
+    if (zpool list -v -P | grep -q ${d}) || (mount | grep -q ${d}); then
+      mounted="yes"
+    fi
   {{ else }}
     # Skip already mounted disks.
-    mount | grep ${d} > /dev/null
+    if mount | grep -q ${d}; then
+      mounted="yes"
+    fi
   {{ end }}
-		if [ $? -ne 0 ]; then
+		if [ "$mounted" -eq "no" ]; then
 			disks+=("${d}")
 			echo "Disk ${d} not mounted, need to mount..."
 		else
@@ -140,7 +145,7 @@ function setup_disks() {
 	{{ end }}
 		chmod 777 ${mountpoint}
 	fi
-	
+
 	# Print the block device and FS usage output. This is useful for debugging.
 	lsblk
 	df -h
@@ -166,11 +171,21 @@ if [ -e {{ .OSInitializedFile }} ]; then
   exit 0
 fi
 
+# set up SSH early so that if any errors occur in this script, we are
+# able to fetch logs to display to the user.
+sudo -u {{ .SharedUser }} bash -c "mkdir -p ~/.ssh && chmod 700 ~/.ssh"
+sudo -u {{ .SharedUser }} bash -c 'echo "{{ .PublicKey }}" >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys'
+
+sudo sed -i 's/#LoginGraceTime .*/LoginGraceTime 0/g' /etc/ssh/sshd_config
+sudo service ssh restart
+
 # Initialize disks and write fstab entries.
 setup_disks true
 
 # sshguard can prevent frequent ssh connections to the same host. Disable it.
-systemctl stop sshguard
+if systemctl is-active --quiet sshguard; then
+    systemctl stop sshguard
+fi
 systemctl mask sshguard
 # increase the number of concurrent unauthenticated connections to the sshd
 # daemon. See https://en.wikibooks.org/wiki/OpenSSH/Cookbook/Load_Balancing.
@@ -246,7 +261,9 @@ for timer in apt-daily-upgrade.timer apt-daily.timer e2scrub_all.timer fstrim.ti
 done
 
 for service in apport.service atd.service; do
-  systemctl stop $service
+  if systemctl is-active --quiet $service; then
+    systemctl stop $service
+  fi
   systemctl mask $service
 done
 
@@ -276,12 +293,6 @@ sysctl --system  # reload sysctl settings
 {{ if .EnableFIPS }}
 sudo ua enable fips --assume-yes
 {{ end }}
-
-sudo -u {{ .SharedUser }} bash -c "mkdir ~/.ssh && chmod 700 ~/.ssh"
-sudo -u {{ .SharedUser }} bash -c 'echo "{{ .PublicKey }}" >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys'
-
-sudo sed -i 's/#LoginGraceTime .*/LoginGraceTime 0/g' /etc/ssh/sshd_config
-sudo service ssh restart
 
 sudo touch {{ .OSInitializedFile }}
 `
